@@ -311,6 +311,8 @@ export default function CommandPalette({
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      // IME 変換中のキーは入力メソッドに渡す。変換確定の Enter を送信・確定と誤認しないため。
+      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
       if (e.key === 'ArrowDown') {
         e.preventDefault()
         setActiveIndex((i) => (flat.length ? (i + 1) % flat.length : 0))
