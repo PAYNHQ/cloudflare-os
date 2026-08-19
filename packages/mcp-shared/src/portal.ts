@@ -20,6 +20,14 @@ import type { McpTool } from "./client.js";
  */
 export const PORTAL_LIST_SERVERS_TOOL = "portal_list_servers";
 
+/**
+ * The portal's tool for opening a URL-based re-authentication page. This is the only recovery path
+ * Cloudflare's MCP Server Portals expose when an upstream server's on-behalf OAuth has lapsed --
+ * there is no dashboard alternative. See `parsePortalReconnectUrl` and the MCP Server Portals
+ * connector's README.
+ */
+export const PORTAL_TOGGLE_SERVERS_TOOL = "portal_toggle_servers";
+
 // Prefix the portal reserves for its own session-management tools.
 const PORTAL_NATIVE_PREFIX = "portal_";
 
@@ -220,6 +228,29 @@ export function parsePortalServers(
     if (listing.recognized) return { servers: listing.servers, complete: listing.complete };
   }
   return structured ?? { servers: [], complete: false };
+}
+
+// Matches the first `https://` URL in prose, stopping at whitespace or a character that commonly
+// closes a URL when one is embedded in a sentence (closing paren/bracket or a quote).
+const HTTPS_URL_PATTERN = /https:\/\/[^\s<>")]+/;
+
+/**
+ * Recovers the re-authentication URL from a `portal_toggle_servers` result, or null if none was
+ * found.
+ *
+ * `portal_toggle_servers`'s response shape is undocumented beyond "opens a URL-based server
+ * selection page", so this reads prose the same way `parsePortalServers` does rather than assuming
+ * a structured field exists. Returning null instead of guessing lets the caller log the full
+ * response for later refinement rather than surfacing an unverified shape to the user.
+ */
+export function parsePortalReconnectUrl(result: { content?: unknown }): string | null {
+  const combinedText = (Array.isArray(result.content) ? result.content : [])
+    .flatMap(block => {
+      const { type, text: blockText } = (block ?? {}) as { type?: unknown; text?: unknown };
+      return type === "text" && typeof blockText === "string" ? [blockText] : [];
+    })
+    .join("\n");
+  return combinedText.match(HTTPS_URL_PATTERN)?.[0] ?? null;
 }
 
 /**
