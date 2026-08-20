@@ -28,6 +28,13 @@ interface ConnectConnectorModalProps {
   credentialsValid?: boolean
   disconnecting?: boolean
   onDisconnect?: () => void
+  // Manage mode: offer Reconnect here even while `credentialsValid` is true. Set for the MCP Server
+  // Portals connector, whose on-behalf authorization to an upstream server can lapse without this
+  // gatekeeper's own `credentialsValid` ever turning false -- see MCP_PORTAL_VENDOR_ID in
+  // routes/gatekeepers.tsx.
+  alwaysOfferReconnect?: boolean
+  onReconnect?: () => void
+  reconnecting?: boolean
   grantedResourceUrlPatterns?: string[]
   // Manage mode: invoked to expand the grant to include the given resource `urlPattern`s.
   onEnsureResources?: (resourceUrlPatterns: string[]) => void
@@ -50,6 +57,9 @@ export default function ConnectConnectorModal({
   credentialsValid = true,
   disconnecting = false,
   onDisconnect,
+  alwaysOfferReconnect = false,
+  onReconnect,
+  reconnecting = false,
   grantedResourceUrlPatterns,
   onEnsureResources,
   ensuringResourceUrlPatterns = [],
@@ -392,6 +402,15 @@ export default function ConnectConnectorModal({
                   </>
                 ) : (
                   <>
+                    {(alwaysOfferReconnect || !credentialsValid) && onReconnect && (
+                      <WorkshopButton
+                        onClick={onReconnect}
+                        disabled={reconnecting}
+                        className="!h-9"
+                      >
+                        {reconnecting ? 'Opening...' : 'Reconnect'}
+                      </WorkshopButton>
+                    )}
                     <Dialog.Close
                       render={(props) => (
                         <WorkshopButton {...props} className="!h-9">
