@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isPortalNativeTool,
   looksLikePortal,
+  parsePortalReconnectUrl,
   parsePortalServers,
   reconcilePortalServers,
   toolBelongsToServer,
@@ -228,5 +229,42 @@ describe("reconcilePortalServers", () => {
       [{ id: "gh", name: "Zulip", enabled: true }, { id: "linear", name: "Asana", enabled: true }],
       tools,
     ).map(server => server.name)).toEqual(["Asana", "Zulip"]);
+  });
+});
+
+describe("reconnect URL recovery", () => {
+  it("recovers a URL embedded in prose", () => {
+    expect(parsePortalReconnectUrl({
+      content: [{ type: "text", text: "Open this to re-authenticate: https://gw.example.com/reauth?x=1" }],
+    })).toBe("https://gw.example.com/reauth?x=1");
+  });
+
+  it("stops at trailing punctuation a sentence would add", () => {
+    expect(parsePortalReconnectUrl({
+      content: [{ type: "text", text: "See (https://gw.example.com/reauth) for details." }],
+    })).toBe("https://gw.example.com/reauth");
+  });
+
+  it("joins multiple text blocks before searching", () => {
+    expect(parsePortalReconnectUrl({
+      content: [
+        { type: "text", text: "Re-authenticate here:" },
+        { type: "text", text: "https://gw.example.com/reauth" },
+      ],
+    })).toBe("https://gw.example.com/reauth");
+  });
+
+  it("returns null when no URL is present, rather than guessing", () => {
+    expect(parsePortalReconnectUrl({
+      content: [{ type: "text", text: "Re-authentication is not currently available." }],
+    })).toBeNull();
+    expect(parsePortalReconnectUrl({ content: [] })).toBeNull();
+    expect(parsePortalReconnectUrl({})).toBeNull();
+  });
+
+  it("ignores non-text content blocks", () => {
+    expect(parsePortalReconnectUrl({
+      content: [{ type: "image", data: "https://gw.example.com/should-be-ignored" }],
+    })).toBeNull();
   });
 });

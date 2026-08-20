@@ -36,8 +36,10 @@ import { McpSessionBase } from "@gadgets/mcp-shared/session";
 import { McpFacetBase } from "@gadgets/mcp-shared/facet";
 import {
   looksLikePortal,
+  parsePortalReconnectUrl,
   parsePortalServers,
   PORTAL_LIST_SERVERS_TOOL,
+  PORTAL_TOGGLE_SERVERS_TOOL,
   reconcilePortalServers,
   type PortalServer,
   type PortalServerListing,
@@ -216,6 +218,43 @@ async function listAvailablePortalServers(
     throw new Error("Could not retrieve the portal's complete server list. Try again.");
   }
   return reconcilePortalServers(reported?.servers ?? [], index.tools);
+}
+
+/**
+ * Opens the portal's own re-authentication page, via `portal_toggle_servers`. Unlike
+ * `getSupportedResources`'s reconnect story, this is not the deployment's OAuth with Cloudflare
+ * Access; it is the portal's on-behalf authorization to an upstream server, and
+ * `portal_toggle_servers` is the only path Cloudflare's MCP Server Portals expose to recover it --
+ * there is no dashboard alternative.
+ *
+ * Called with no arguments: the tool is documented only as "opens a URL-based server selection
+ * page", with nothing suggesting a required argument, and the sibling `portal_list_servers` takes
+ * none either.
+ *
+ * The response shape is undocumented, so the URL is recovered by the same permissive prose scan as
+ * `portal_list_servers` rather than trusting a guessed structured field. When no URL can be found,
+ * the full response is logged for later inspection but never folded into the thrown message --
+ * its shape is unverified, so it must not reach the user-facing error.
+ */
+async function reconnectPortal(
+  env: Env,
+  account: DurableObjectStub<McpAccount>,
+  endpoint: string,
+): Promise<string> {
+  const result = await withClient(env, account, endpoint,
+    client => client.callTool(PORTAL_TOGGLE_SERVERS_TOOL, {}));
+  const url = result.isError ? null : parsePortalReconnectUrl(result);
+  if (!url) {
+    // The raw response shape is unverified, so it goes through `error` (logged, never surfaced)
+    // rather than into the thrown message below, which reaches the user.
+    logger.warn("could not recover a reconnect URL from the portal", {
+      event: "portal.reconnect.url.missing",
+      serverHost: hostOf(endpoint),
+      error: JSON.stringify(result),
+    });
+    throw new Error("Could not get a re-authentication URL from the portal.");
+  }
+  return url;
 }
 
 // HTTP handler. There is no page asking which server to connect, since the endpoint is configured,
@@ -421,6 +460,22 @@ export class GatekeeperUserImpl
       scope,
     };
     return { class: this.ctx.exports.McpGatekeeperImpl({ props }), resource };
+  }
+
+  /**
+   * Overrides the inherited `reconnect()`: that base implementation only restarts this
+   * gatekeeper's own OAuth with Cloudflare Access, and never touches the portal's on-behalf
+   * authorization to whichever upstream server is failing. When an upstream token lapses, the
+   * Gadget-facing error tells the user to "Call the portal_toggle_servers tool to
+   * re-authenticate" -- something only this Worker, not the Gadget, is positioned to do. So this
+   * calls that tool itself. Falling back to the inherited flow on failure would reproduce the bug
+   * this fixes: the user reconnects, nothing about the upstream authorization changes, and the
+   * error returns on the next call.
+   */
+  async reconnect(): Promise<{ url: string }> {
+    const server = await this.#account().getServer();
+    const url = await reconnectPortal(this.env, this.#account(), server.endpoint);
+    return { url };
   }
 
   async startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
