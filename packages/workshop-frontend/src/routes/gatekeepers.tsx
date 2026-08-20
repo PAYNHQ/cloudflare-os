@@ -30,6 +30,14 @@ export const Route = createFileRoute('/gatekeepers')({
   component: ConnectorsPage,
 })
 
+// The MCP Server Portals gatekeeper's vendor id (see VENDOR_ID in gatekeeper-mcp-portal/src/portal.ts).
+// That connector's `credentialsValid` only reflects its own OAuth with Cloudflare Access -- it can't
+// see the portal's separate on-behalf authorization to whichever upstream server it fronts, so that
+// authorization can lapse while the account still reads as connected here. Always offering Reconnect
+// for this vendor is the only way a user can reach the portal's own re-authentication (see
+// GatekeeperUserImpl.reconnect() in gatekeeper-mcp-portal), since nothing else surfaces the lapse.
+const MCP_PORTAL_VENDOR_ID = 'mcp_portal'
+
 interface AccountEntry {
   id: number
   accountDescription: AccountDescription
@@ -86,6 +94,10 @@ interface ConnectorCardProps {
   onClick: () => void
   onReconnect?: () => void
   reconnectBusy?: boolean
+  // Offer Reconnect even while `state === 'connected'`. Used for the MCP Server Portals connector,
+  // whose on-behalf authorization to an upstream server can lapse without this gatekeeper's own
+  // `credentialsValid` (and thus `state`) ever turning `expired` -- see MCP_PORTAL_VENDOR_ID below.
+  alwaysOfferReconnect?: boolean
   view?: 'grid' | 'list'
 }
 
@@ -101,6 +113,7 @@ function ConnectorCard({
   onClick,
   onReconnect,
   reconnectBusy = false,
+  alwaysOfferReconnect = false,
   view = 'grid',
 }: ConnectorCardProps) {
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -136,13 +149,16 @@ function ConnectorCard({
     </span>
   ) : null
 
+  const showReconnect =
+    Boolean(onReconnect) && (state === 'expired' || (state === 'connected' && alwaysOfferReconnect))
+
   const trailing =
-    state === 'expired' && onReconnect ? (
+    showReconnect ? (
       <button
         type="button"
         onClick={(e) => {
           e.stopPropagation()
-          if (!reconnectBusy) onReconnect()
+          if (!reconnectBusy) onReconnect?.()
         }}
         disabled={reconnectBusy}
         className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full border border-kumo-line bg-kumo-base px-3 text-[12px] leading-4 font-medium tracking-[-0.2px] text-kumo-default transition-[background-color,border-color,opacity,transform] duration-150 ease-out hover:border-kumo-fill hover:bg-kumo-tint active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100"
@@ -797,6 +813,7 @@ function ConnectorsPage() {
                     onClick={() => handleOpenManage(account.id)}
                     onReconnect={() => handleReconnect(account.id)}
                     reconnectBusy={reconnectingAccountId === account.id}
+                    alwaysOfferReconnect={account.vendorId === MCP_PORTAL_VENDOR_ID}
                     view={view}
                   />
                 )
@@ -869,6 +886,11 @@ function ConnectorsPage() {
           ensuringResourceUrlPatterns={ensuringResourceUrlPatterns}
           disconnecting={disconnecting}
           onDisconnect={handleDisconnect}
+          // See MCP_PORTAL_VENDOR_ID: this vendor's on-behalf authorization can lapse without
+          // `credentialsValid` ever turning false, so it always gets a Reconnect action here too.
+          alwaysOfferReconnect={activeAccount?.vendorId === MCP_PORTAL_VENDOR_ID}
+          onReconnect={activeAccount ? () => handleReconnect(activeAccount.id) : undefined}
+          reconnecting={reconnectingAccountId === activeAccount?.id}
           onOpenChange={(open) => {
             if (!open && !connecting && !disconnecting) handleCloseModal()
           }}
