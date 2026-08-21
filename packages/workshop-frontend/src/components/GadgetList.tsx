@@ -10,6 +10,7 @@ import { BindingBadge, getGradient as getBlueprintGradient, uniqueBindingBadges 
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from './menuStyles'
 import { BlueprintPreviewImage } from './BlueprintPreviewImage'
 import DeleteConfirmationDialog from './DeleteConfirmationDialog'
+import { isImeComposing } from '../keyboardEvent'
 
 // Neutral monogram for a workspace — matches the sidebar treatment (no per-item color noise).
 function initials(title: string | undefined): string {
@@ -96,8 +97,7 @@ function AppRow({
               onChange={(e) => setRenameValue(e.target.value)}
               onBlur={commitRename}
               onKeyDown={(e) => {
-                // IME 変換中のキーは入力メソッドに渡す。変換確定の Enter を送信・確定と誤認しないため。
-                if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                if (isImeComposing(e)) return
                 if (e.key === 'Enter') commitRename()
                 if (e.key === 'Escape') setIsRenaming(false)
               }}

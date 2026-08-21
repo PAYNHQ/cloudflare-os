@@ -11,6 +11,7 @@ import { useAuthenticatedApi } from '../../AuthContext'
 import type { GadgetMetadataWithTimestamps, OutputFormatOffer } from '@gadgets/workshop-shared/api'
 import { FormatGlyph } from '../format/FormatVisuals'
 import { createFromFormat } from '../format/useOutputFormats'
+import { isImeComposing } from '../../keyboardEvent'
 
 // A ⌘K command palette: jump to a workspace or a primary destination. Because it's keyboard-driven
 // and opened many times a day, it deliberately has *no* open/close animation (instant feels faster
@@ -311,8 +312,7 @@ export default function CommandPalette({
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      // IME 変換中のキーは入力メソッドに渡す。変換確定の Enter を送信・確定と誤認しないため。
-      if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+      if (isImeComposing(e)) return
       if (e.key === 'ArrowDown') {
         e.preventDefault()
         setActiveIndex((i) => (flat.length ? (i + 1) % flat.length : 0))

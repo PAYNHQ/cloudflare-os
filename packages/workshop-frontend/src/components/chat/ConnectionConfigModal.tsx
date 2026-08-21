@@ -3,6 +3,7 @@ import { Dialog, Button, Input } from '@cloudflare/kumo'
 import { X } from '@phosphor-icons/react'
 import type { Connection, ConnectionResource } from '../../data/sample'
 import { logoComponents } from '../ConnectionLogos'
+import { isImeComposing } from '../../keyboardEvent'
 
 export default function ConnectionConfigModal({
   connection,
@@ -39,7 +40,7 @@ export default function ConnectionConfigModal({
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog size="base" className="p-0 overflow-hidden">
+      <Dialog size="base" className="responsive-dialog overflow-hidden p-0">
         {/* Header */}
         <div className="flex items-center gap-3 px-5 pt-5 pb-4">
           <div
@@ -80,8 +81,7 @@ export default function ConnectionConfigModal({
                   value={inputValue}
                   onChange={(e) => setInputValue(e.currentTarget.value)}
                   onKeyDown={(e) => {
-                    // IME 変換中のキーは入力メソッドに渡す。変換確定の Enter を送信・確定と誤認しないため。
-                    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                    if (isImeComposing(e)) return
                     if (e.key === 'Enter') handleAdd()
                   }}
                   placeholder={config.placeholder}
