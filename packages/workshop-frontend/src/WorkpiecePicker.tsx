@@ -5,6 +5,7 @@ import { Tooltip } from '@cloudflare/kumo'
 import type { WorkpieceId, WorkpieceSummary } from '@gadgets/workshop-shared/api'
 import { CountBadge } from './components/CountBadge'
 import { WorkshopIconButton, WorkshopInput } from './components/WorkshopControls'
+import { isImeComposing } from './keyboardEvent'
 
 export const WORKPIECE_RAIL_COLLAPSED_WIDTH = 48
 export const WORKPIECE_RAIL_EXPANDED_WIDTH = 220
@@ -88,8 +89,7 @@ export default function WorkpiecePicker({
                   value={editing.value}
                   onChange={e => setEditing({ id: gadget.id, value: e.target.value })}
                   onKeyDown={e => {
-                    // IME 変換中のキーは入力メソッドに渡す。変換確定の Enter を送信・確定と誤認しないため。
-                    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                    if (isImeComposing(e)) return
                     if (e.key === 'Enter') commitRename()
                     if (e.key === 'Escape') setEditing(null)
                   }}

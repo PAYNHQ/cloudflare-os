@@ -4,6 +4,7 @@ import { DropdownMenu } from '@cloudflare/kumo'
 import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER, MENU_POSITIONER_STYLE } from '../menuStyles'
 import { useState, useEffect, useRef } from 'react'
 import type { GadgetMetadataWithTimestamps } from '@gadgets/workshop-shared/api'
+import { isImeComposing } from '../../keyboardEvent'
 
 function initials(title: string | undefined): string {
   const t = (title || 'Untitled').trim()
@@ -78,8 +79,7 @@ export default function SidebarGadgetRow({
               onChange={(e) => setRenameValue(e.target.value)}
               onBlur={commit}
               onKeyDown={(e) => {
-                // IME 変換中のキーは入力メソッドに渡す。変換確定の Enter を送信・確定と誤認しないため。
-                if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+                if (isImeComposing(e)) return
                 if (e.key === 'Enter') commit()
                 if (e.key === 'Escape') setRenaming(false)
               }}
