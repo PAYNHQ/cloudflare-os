@@ -35,10 +35,17 @@ vi.mock('./WorkshopControls', () => ({
 
 import ConnectConnectorModal from './ConnectConnectorModal'
 
+type OnReconnect = NonNullable<ComponentProps<typeof ConnectConnectorModal>['onReconnect']>
+
 const VENDOR: VendorDescription = {
   displayName: 'MCP Server Portals',
   url: 'https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/',
   color: '#f6821f',
+}
+
+function reconnectButton(rendered: HTMLDivElement) {
+  return Array.from(rendered.querySelectorAll('button'))
+    .find((button) => button.textContent?.includes('Reconnect'))
 }
 
 describe('ConnectConnectorModal manage mode Reconnect', () => {
@@ -74,25 +81,20 @@ describe('ConnectConnectorModal manage mode Reconnect', () => {
     return container
   }
 
-  function reconnectButton(rendered: HTMLDivElement) {
-    return Array.from(rendered.querySelectorAll('button'))
-      .find((button) => button.textContent?.includes('Reconnect'))
-  }
-
   it('hides Reconnect when credentials are valid and alwaysOfferReconnect is unset', async () => {
     const rendered = await render()
     expect(reconnectButton(rendered)).toBeUndefined()
   })
 
   it('shows Reconnect when credentials have expired, regardless of alwaysOfferReconnect', async () => {
-    const rendered = await render({ credentialsValid: false, onReconnect: vi.fn() })
+    const rendered = await render({ credentialsValid: false, onReconnect: vi.fn<OnReconnect>() })
     expect(reconnectButton(rendered)).toBeDefined()
   })
 
   it('shows Reconnect for a connector with alwaysOfferReconnect even while credentials are valid', async () => {
     // Mirrors the MCP Server Portals connector: its own `credentialsValid` can't see the portal's
     // separate on-behalf authorization lapsing, so it always offers Reconnect here.
-    const onReconnect = vi.fn()
+    const onReconnect = vi.fn<OnReconnect>()
     const rendered = await render({
       credentialsValid: true,
       alwaysOfferReconnect: true,

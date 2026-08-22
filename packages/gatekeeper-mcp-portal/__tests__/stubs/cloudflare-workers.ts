@@ -9,6 +9,7 @@ export class DurableObject<E = unknown, P = unknown> {
   constructor(readonly ctx: unknown, readonly env: E, readonly props?: P) {}
 }
 
+// oxlint-disable-next-line typescript/no-extraneous-class -- Must remain a constructible RPC base class.
 export class RpcTarget {}
 
 export class WorkerEntrypoint<E = unknown, P = unknown> {
