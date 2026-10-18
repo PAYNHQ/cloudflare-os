@@ -1,14 +1,19 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SUGGESTED_MODELS, type AiChatAuthorInfo, type AiModelConfig, type BuiltInReasoning,
 } from "@gadgets/workshop-shared/api";
+import {
+  Type, type AssistantMessage, type ClassifierContext, type ToolResultMessage,
+} from "@earendil-works/pi-ai";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { serializeAdminConfig } from "../src/admin-config.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig } from "../src/storage-schema/admin-settings-storage.js";
+import { zeroUsage } from "../src/ai-invoke.js";
 import {
-  gatewayBuiltInReasoning, gatewayReasoningLevels, getModel, isRuntimeModel,
-  LanguageModelGatekeeper, type ModelHandle,
+  DecisionModelGatekeeper, gatewayBuiltInReasoning, gatewayReasoningLevels, getDecisionModel,
+  getModel, isRuntimeModel, LanguageModelGatekeeper, type ModelHandle,
 } from "../src/ai-models.js";
 
 // These tests exercise the real pi-ai stack: no module mocks. Routing decisions are asserted on
@@ -861,10 +866,12 @@ describe("gateway model reasoning levels", () => {
 
   // pi's Google adapter refuses an injected fetch, so the request is read from the payload hook,
   // which fails it before anything is sent.
-  async function googleThinking(model: string, level?: Level,
-                                behavesLike?: string): Promise<unknown> {
+  async function googleThinking(
+      model: string, level?: Level, behavesLike?: string,
+      capabilities?: AiModelConfig["capabilities"]): Promise<unknown> {
     const handle = getModel(gatewayEnv,
-        { provider: "google", model, apiToken: "", reasoning: level, behavesLike }, INITIATOR);
+        { provider: "google", model, apiToken: "", reasoning: level, behavesLike, capabilities },
+        INITIATOR);
     let config: { thinkingConfig?: unknown } | undefined;
     const stream = handle.stream(handle.model, {
       messages: [{ role: "user", content: "hello", timestamp: 0 }],
@@ -1002,6 +1009,8 @@ describe("gateway model reasoning levels", () => {
     ["cloudflare", "@cf/zai-org/glm-5.2", null],
     ["cloudflare", "@cf/zai-org/glm-5.3-flash", null],
     ["cloudflare", "@cf/deepseek-ai/deepseek-v4-pro-0813", null],
+    ["cloudflare", "@cf/cloudflare/clef", null],
+    ["cloudflare", "@cf/cloudflare/clef-flash", null],
   ];
   it.each(BUILT_IN)("says what %s model %s is asked for while no level is set",
       (provider, model, builtIn) => {
@@ -1028,6 +1037,9 @@ describe("gateway model reasoning levels", () => {
     // pi marks GPT-4o as a model that does no reasoning, which it sends no effort.
     ["openai", "gpt-4o", undefined, null],
     ["openai", "gpt-next", "gpt-4o", null],
+    // pi gives GPT-5 Pro "high" alone, so that is the effort in place of "medium".
+    ["openai", "gpt-5-pro", undefined, "high"],
+    ["openai", "gpt-next", "gpt-5-pro", "high"],
     ["cloudflare", "@cf/test/next", undefined, null],
     ["cloudflare", "@cf/test/next", "@cf/zai-org/glm-5.2", null],
     ["google", "gemini-next", undefined, null],
@@ -1191,6 +1203,207 @@ describe("gateway model reasoning levels", () => {
       }
     });
   });
+
+  describe("for a model with stated capabilities", () => {
+    // Added models pi has no entry for, as GatewayModels.resolve() describes them.
+    const CLAUDE: GatewayConfig = { provider: "anthropic", model: "claude-next" };
+    const GPT_NEXT: GatewayConfig = { provider: "openai", model: "gpt-next" };
+    const KIMI_K3: GatewayConfig = { provider: "cloudflare", model: "@cf/moonshotai/kimi-k3" };
+    const stating = (config: GatewayConfig, ...reasoningLevels: Level[]): GatewayConfig =>
+        ({ ...config, capabilities: { reasoningLevels } });
+    const levels = ({ provider, model, behavesLike, capabilities }: GatewayConfig) =>
+        gatewayReasoningLevels(provider, model, behavesLike, capabilities);
+    const builtIn = ({ provider, model, behavesLike, capabilities }: GatewayConfig) =>
+        gatewayBuiltInReasoning(provider, model, behavesLike, capabilities);
+    const input = (config: GatewayConfig) =>
+        getModel(gatewayEnv, { ...config, apiToken: "" }, INITIATOR).model.input;
+
+    it.each<[GatewayConfig["provider"], string, Level[]]>([
+      ["anthropic", "claude-next", ["off", "high", "xhigh"]],
+      ["anthropic", "claude-next", ["low", "max"]],
+      ["openai", "gpt-next", ["off", "minimal", "xhigh", "max"]],
+      ["google", "gemini-next", ["low", "high", "xhigh"]],
+      ["cloudflare", "@cf/moonshotai/kimi-k3", ["off", "high"]],
+      ["cloudflare", "cloudflare/auto", ["low", "high", "max"]],
+    ])("lists the levels stated for %s model %s: %j", (provider, model, stated) => {
+      expect(levels(stating({ provider, model }, ...stated))).toEqual(stated);
+    });
+
+    it("lists none for a model stated to do no reasoning, which is asked for none", async () => {
+      for (const stated of [[], ["off"]] as Level[][]) {
+        const gpt = stating(GPT_NEXT, ...stated);
+        expect(levels(gpt)).toEqual([]);
+        expect(builtIn(gpt)).toBeNull();
+        expect(await parsed(gpt)).toEqual(gptBody(GPT_NEXT, {}));
+        expect(await parsed({ ...gpt, reasoning: "high" })).toEqual(gptBody(GPT_NEXT, {}));
+        // The statement comes ahead of the reasoning GLM 5.2 would lend.
+        const glmLike = stating({ ...KIMI_K3, behavesLike: GLM.model }, ...stated);
+        expect(levels(glmLike)).toEqual([]);
+        expect(await parsed({ ...glmLike, reasoning: "high" })).toEqual(completionsBody(KIMI_K3));
+      }
+    });
+
+    // Neither the adaptive thinking that Claude Sonnet 5 would lend is asked for, nor the effort
+    // that pi manages for Claude Opus 5.5, which it has think on every request.
+    it("asks a Claude stated to do no reasoning for no thinking, whatever it behaves like",
+        async () => {
+      for (const stated of [[], ["off"]] as Level[][]) {
+        for (const behavesLike of [undefined, SONNET_5.model, OPUS.model]) {
+          const claude = { ...CLAUDE, behavesLike };
+          const config = stating(claude, ...stated);
+          expect(levels(config)).toEqual([]);
+          expect(builtIn(config)).toBeNull();
+          expect(await parsed(config)).toEqual(claudeBody(CLAUDE, 4096));
+          expect(await parsed({ ...config, reasoning: "high" })).toEqual(claudeBody(CLAUDE, 4096));
+        }
+      }
+      // One stated to reason keeps the thinking it borrows.
+      const reasoning = stating({ ...CLAUDE, behavesLike: SONNET_5.model }, "low", "max");
+      expect(builtIn(reasoning)).toBe("adaptive");
+      expect(reasoningAsked(await parsed(reasoning))).toEqual(builtInRequest("adaptive"));
+      const managed = stating({ ...CLAUDE, behavesLike: OPUS.model }, "low", "max");
+      expect(builtIn(managed)).toBe("adaptive");
+      expect(await parsed(managed))
+          .toEqual({ ...opusBody("high"), model: CLAUDE.model, max_tokens: 4096 });
+      expect(await parsed({ ...managed, reasoning: "max" }))
+          .toEqual({ ...opusBody("max"), model: CLAUDE.model, max_tokens: 4096 });
+    });
+
+    // While no level is set an OpenAI model is asked for "medium", or for the stated level that
+    // a set "medium" would be clamped to.
+    it.each<[Level[], Level]>([
+      [["high"], "high"], [["high", "xhigh"], "high"], [["off", "minimal", "low"], "low"],
+      [["medium"], "medium"], [["off", "low", "medium", "high"], "medium"],
+    ])("asks an OpenAI model stated %j for effort %s while no level is set",
+        async (stated, effort) => {
+      const gpt = stating(GPT_NEXT, ...stated);
+      expect(builtIn(gpt)).toBe(effort);
+      expect(await parsed(gpt)).toEqual(gptEffortBody(GPT_NEXT, effort));
+    });
+
+    it("sends a Workers AI model a stated level as its effort, and none while no level is set",
+        async () => {
+      const k3 = stating(KIMI_K3, "off", "high");
+      expect(await parsed({ ...k3, reasoning: "high" }))
+          .toEqual(completionsBody(KIMI_K3, { reasoning_effort: "high" }));
+      expect(await parsed(k3)).toEqual(completionsBody(KIMI_K3));
+      // With no wire value to borrow, "off" is sent as Workers AI's own word for it: sent no
+      // effort, the model would go on reasoning.
+      expect(await parsed({ ...k3, reasoning: "off" }))
+          .toEqual(completionsBody(KIMI_K3, { reasoning_effort: "none" }));
+      expect(await parsed({ ...k3, reasoning: "high" }, { thinking: false }))
+          .toEqual(completionsBody(KIMI_K3, { reasoning_effort: "none" }));
+      // One stated to do no reasoning has none to stop.
+      expect(await parsed({ ...stating(KIMI_K3, "off"), reasoning: "off" }))
+          .toEqual(completionsBody(KIMI_K3));
+    });
+
+    // The next stated level up and, with none above, the highest.
+    it.each([
+      ["off", "low"], ["minimal", "low"], ["low", "low"], ["medium", "high"], ["high", "high"],
+      ["xhigh", "max"], ["max", "max"],
+    ] as const)("clamps level %s to stated effort %s", async (level, reasoning_effort) => {
+      const auto = stating({ provider: "cloudflare", model: "cloudflare/auto" },
+          "low", "high", "max");
+      expect(await parsed({ ...auto, reasoning: level }))
+          .toEqual(completionsBody(auto, { reasoning_effort }));
+    });
+
+    it("asks an OpenAI model for a stated level by its own name", async () => {
+      const gpt = stating(GPT_NEXT, "off", "minimal", "xhigh", "max");
+      for (const level of ["minimal", "xhigh", "max"] as const) {
+        expect(await parsed({ ...gpt, reasoning: level })).toEqual(gptEffortBody(GPT_NEXT, level));
+      }
+      expect(await parsed({ ...gpt, reasoning: "low" })).toEqual(gptEffortBody(GPT_NEXT, "xhigh"));
+      expect(await parsed({ ...gpt, reasoning: "off" }))
+          .toEqual(gptBody(GPT_NEXT, { reasoning: { effort: "none" } }));
+      // One that is not stated to stop reasoning is asked for its lowest level.
+      expect(await parsed({ ...stating(GPT_NEXT, "high", "max"), reasoning: "off" }))
+          .toEqual(gptEffortBody(GPT_NEXT, "high"));
+    });
+
+    it("gives an Anthropic model a stated level as a budget, or as the effort of the model " +
+        "it behaves like", async () => {
+      const budget = (budget_tokens: number) => claudeBody(CLAUDE, 4096,
+          { thinking: { type: "enabled", budget_tokens, display: "summarized" } });
+      const claude = stating(CLAUDE, "low", "max");
+      expect(await parsed({ ...claude, reasoning: "max" })).toEqual(budget(3072));
+      // It is not stated to stop thinking, so "off" is its lowest level.
+      expect(await parsed({ ...claude, reasoning: "off" })).toEqual(budget(2048));
+
+      const adaptive = (effort: string) => claudeBody(CLAUDE, 4096, {
+        thinking: { type: "adaptive", display: "summarized" }, output_config: { effort },
+      });
+      const likeSonnet = { ...claude, behavesLike: SONNET_5.model };
+      expect(await parsed({ ...likeSonnet, reasoning: "max" })).toEqual(adaptive("max"));
+      expect(await parsed({ ...likeSonnet, reasoning: "xhigh" })).toEqual(adaptive("max"));
+      expect(await parsed({ ...likeSonnet, reasoning: "off" })).toEqual(adaptive("low"));
+    });
+
+    // Gemini has no level above "high", which is what the two levels above it are sent as.
+    it("asks a Gemini model for a stated level in the format the model takes", async () => {
+      const stated = { reasoningLevels: ["low", "high", "xhigh"] as Level[] };
+      const flash = "gemini-3.6-flash";
+      expect(await googleThinking("gemini-next", "xhigh", flash, stated))
+          .toEqual({ includeThoughts: true, thinkingLevel: "HIGH" });
+      expect(await googleThinking("gemini-next", "off", flash, stated))
+          .toEqual({ includeThoughts: true, thinkingLevel: "LOW" });
+      // With no model to behave like, it is given a budget.
+      expect(await googleThinking("gemini-next", "xhigh", undefined, stated))
+          .toEqual({ includeThoughts: true, thinkingBudget: 16384 });
+      expect(await googleThinking("gemini-next", "minimal", undefined, stated))
+          .toEqual({ includeThoughts: true, thinkingBudget: 2048 });
+    });
+
+    it("comes ahead of what the model it behaves like lends", async () => {
+      // GLM 5.2 takes "off", "high" and "max", and no images.
+      const glmLike: GatewayConfig = { ...KIMI_K3, behavesLike: GLM.model };
+      const stated = stating(glmLike, "off", "low");
+      expect(levels(glmLike)).toEqual(["off", "high", "max"]);
+      expect(levels(stated)).toEqual(["off", "low"]);
+      expect(await parsed({ ...stated, reasoning: "low" }))
+          .toEqual(completionsBody(KIMI_K3, { reasoning_effort: "low" }));
+      expect(await parsed({ ...stated, reasoning: "max" }))
+          .toEqual(completionsBody(KIMI_K3, { reasoning_effort: "low" }));
+      // A stated level is sent as the other model's wire value for it, where it has one.
+      expect(await parsed({ ...stated, reasoning: "off" }))
+          .toEqual(completionsBody(KIMI_K3, { reasoning_effort: "none" }));
+
+      expect(input(glmLike)).toEqual(["text"]);
+      expect(input({ ...glmLike, capabilities: { imageInput: true } })).toEqual(["text", "image"]);
+      // What is not stated is borrowed.
+      expect(levels({ ...glmLike, capabilities: { imageInput: true } }))
+          .toEqual(["off", "high", "max"]);
+      const flashLike: GatewayConfig = { ...KIMI_K3, behavesLike: GLM_FLASH.model };
+      expect(input(stating(flashLike, "high"))).toEqual(["text", "image"]);
+      expect(input({ ...flashLike, capabilities: { imageInput: false } })).toEqual(["text"]);
+    });
+
+    it("says whether the model takes images, where the provider's default says otherwise", () => {
+      expect(input(KIMI_K3)).toEqual(["text"]);
+      expect(input({ ...KIMI_K3, capabilities: { imageInput: true } })).toEqual(["text", "image"]);
+      for (const config of [CLAUDE, GPT_NEXT, { provider: "google", model: "gemini-next" }] as
+          GatewayConfig[]) {
+        expect(input(config), config.provider).toEqual(["text", "image"]);
+        expect(input({ ...config, capabilities: { imageInput: false } }), config.provider)
+            .toEqual(["text"]);
+        // Stating the levels alone leaves the default.
+        expect(input(stating(config, "high")), config.provider).toEqual(["text", "image"]);
+      }
+    });
+
+    it("is ignored by a model pi knows", async () => {
+      const capabilities = { imageInput: false, reasoningLevels: ["max"] as Level[] };
+      expect(levels({ ...CLAUDE, capabilities })).toEqual(["max"]);
+      expect(input({ ...CLAUDE, capabilities })).toEqual(["text"]);
+
+      expect(levels({ ...HAIKU, capabilities })).toEqual(OFF_TO_HIGH);
+      expect(input({ ...HAIKU, capabilities })).toEqual(["text", "image"]);
+      expect(await parsed({ ...HAIKU, capabilities, reasoning: "low" })).toEqual(claudeBody(
+          HAIKU, 64000,
+          { thinking: { type: "enabled", budget_tokens: 2048, display: "summarized" } }));
+    });
+  });
 });
 
 describe("LanguageModelGatekeeper.startSession", () => {
@@ -1303,6 +1516,28 @@ describe("LanguageModelGatekeeper.startSession", () => {
   });
 });
 
+// A decision model binding is revoked as a language model binding is (see refuseRevokedModel()).
+describe("DecisionModelGatekeeper.startSession", () => {
+  it("refuses a decision model the admin disabled", async () => {
+    const admin = { ...DEFAULT_ADMIN_CONFIG, modelModes: { "@cf/cloudflare/clef": "disabled" } };
+    const gatekeeper =
+        Object.create(DecisionModelGatekeeper.prototype) as DecisionModelGatekeeper;
+    Object.assign(gatekeeper, {
+      env: env({
+        CF_AI_GATEWAY_PROVIDERS: "cloudflare",
+        BLUEPRINTS: { get: async () => serializeAdminConfig(admin) } as unknown as KVNamespace,
+      }),
+      ctx: { props: {
+        displayName: "Clef",
+        config: { provider: "cloudflare", model: "@cf/cloudflare/clef", apiToken: "" },
+        initiator: GADGET_INITIATOR,
+      } },
+    });
+    await expect(gatekeeper.startSession(undefined as never)).rejects.toThrow(new Error(
+        'The "Clef (Workers AI)" model is disabled on this deployment by an administrator.'));
+  });
+});
+
 describe("PDF attachment bridging", () => {
   beforeEach(() => {
     capturedRequests.length = 0;
@@ -1369,8 +1604,85 @@ describe("PDF attachment bridging", () => {
   }, 15000);
 });
 
+describe("Gemini function call signatures", () => {
+  beforeEach(() => {
+    capturedRequests.length = 0;
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // Gemini 3 rejects a request whose current turn holds a function call without a thought
+  // signature, which history replay's synthetic calls lack. pi's Google adapter refuses an injected
+  // fetch, so the request is read from the global one.
+  it("gives a call the model didn't make Google's stand-in, and keeps the model's own", async () => {
+    vi.stubGlobal("fetch", fetchStub);
+    const handle = getModel(env(), {
+      provider: "google",
+      model: "gemini-3.6-flash",
+      apiToken: "ignored-in-gateway-mode",
+    }, INITIATOR);
+    // One step of a tool loop: the call, then its result.
+    const step = (id: string, thoughtSignature?: string): [AssistantMessage, ToolResultMessage] => [{
+      role: "assistant",
+      content: [{
+        type: "toolCall", id, name: "observeUserChanges", arguments: {},
+        ...(thoughtSignature !== undefined && { thoughtSignature }),
+      }],
+      api: handle.model.api,
+      provider: handle.model.provider,
+      model: handle.model.id,
+      usage: zeroUsage(),
+      stopReason: "toolUse",
+      timestamp: 0,
+    }, {
+      role: "toolResult",
+      toolCallId: id,
+      toolName: "observeUserChanges",
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      timestamp: 0,
+    }];
+    const stream = handle.stream(handle.model, {
+      messages: [
+        { role: "user", content: "hello", timestamp: 0 },
+        ...step("model-call", "c2lnbmF0dXJl"),
+        ...step("synthetic_3"),
+      ],
+    }, { maxRetries: 0 });
+    expect((await stream.result()).stopReason).toBe("error");
+
+    const part = z.object({
+      functionCall: z.object({}).optional(),
+      thoughtSignature: z.string().optional(),
+    });
+    const body = z.object({ contents: z.array(z.object({ parts: z.array(part) })) })
+        .parse(JSON.parse(capturedRequests[0].body));
+    expect(body.contents.flatMap(content => content.parts)
+        .filter(entry => entry.functionCall !== undefined)
+        .map(entry => entry.thoughtSignature))
+        .toEqual(["c2lnbmF0dXJl", "skip_thought_signature_validator"]);
+  }, 15000);
+});
+
 // Counts the cache breakpoints in an Anthropic request body.
 const breakpointCount = (body: string) => body.split(`"cache_control"`).length - 1;
+
+// The lifetime of each cache breakpoint in an Anthropic request body, in prompt order: tools,
+// system blocks, then messages.
+function breakpointTtls(body: string): string[] {
+  const blocks = z.object({ cache_control: z.object({ ttl: z.string().optional() }).optional() });
+  const request = z.object({
+    tools: z.array(blocks).default([]),
+    system: z.array(blocks).default([]),
+    messages: z.array(z.object({ content: z.union([z.string(), z.array(blocks)]) })),
+  }).parse(JSON.parse(body));
+  return [
+    ...request.tools,
+    ...request.system,
+    ...request.messages.flatMap(message => typeof message.content === "string" ? [] : message.content),
+  ].flatMap(block => block.cache_control ? [block.cache_control.ttl ?? "5m"] : []);
+}
 
 describe("System prompt cache blocks", () => {
   // The agent's leading system message: shared text as its content, project-specific text as a
@@ -1379,6 +1691,7 @@ describe("System prompt cache blocks", () => {
   // outgoing request with one whose prompt is the same text as plain content.
   const STATIC_TEXT = "Shared instructions.";
   const RENDERED_TEXT = `${STATIC_TEXT}\n\nThis workspace's gadgets.`;
+  const TOOL = { name: "lookUp", description: "Looks something up.", parameters: Type.Object({}) };
 
   async function captureBody(
       handle: ModelHandle, sections: boolean,
@@ -1389,9 +1702,10 @@ describe("System prompt cache blocks", () => {
         sections
             ? {
                 role: "system", content: STATIC_TEXT,
-                sections: { environment: "This workspace's gadgets." }, timestamp: 0,
+                sections: { environment: "This workspace's gadgets." }, toolsAdded: [TOOL],
+                timestamp: 0,
               }
-            : { role: "system", content: RENDERED_TEXT, timestamp: 0 },
+            : { role: "system", content: RENDERED_TEXT, toolsAdded: [TOOL], timestamp: 0 },
         { role: "user", content: "hello", timestamp: 0 },
       ],
     }, { fetch: fetchStub, maxRetries: 0, ...options });
@@ -1412,12 +1726,16 @@ describe("System prompt cache blocks", () => {
 
     const { system: unsplitSystem } = JSON.parse(unsplit);
     expect(unsplitSystem.at(-1)).toMatchObject({ text: RENDERED_TEXT });
+    const forAnHour = { type: "ephemeral", ttl: "1h" };
     expect(JSON.parse(split).system).toEqual([
-      ...unsplitSystem.slice(0, -1),
-      { type: "text", text: STATIC_TEXT, cache_control: { type: "ephemeral" } },
+      ...unsplitSystem.slice(0, -1).map((block: object) => ({ ...block, cache_control: forAnHour })),
+      { type: "text", text: STATIC_TEXT, cache_control: forAnHour },
       { type: "text", text: RENDERED_TEXT.slice(STATIC_TEXT.length) },
     ]);
     expect(breakpointCount(split)).toBe(breakpointCount(unsplit));
+    // The head is kept for an hour and the chat's messages for 5 minutes. Anthropic rejects a
+    // 1-hour breakpoint after a 5-minute one.
+    expect(breakpointTtls(split)).toEqual(["1h", ...unsplitSystem.map(() => "1h"), "5m"]);
   }, 15000);
 
   function openAiHandle(model: string): ModelHandle {
@@ -1448,4 +1766,137 @@ describe("System prompt cache blocks", () => {
     expect(JSON.parse(split).input[0]).toMatchObject({ content: RENDERED_TEXT });
     expect(split).toBe(await captureBody(handle, false, options));
   }, 15000);
+
+  // A chat's handle, whose affinity pi sends as the prompt cache key.
+  const chatHandle = (model: string) => getModel(env({ CF_AI_GATEWAY: undefined }),
+      { provider: "openai", model, apiToken: "direct-api-token" }, INITIATOR,
+      { sessionAffinity: "chat-7" });
+
+  it("drops the chat's prompt cache key from a split GPT-5.6 request", async () => {
+    expect(JSON.parse(await captureBody(chatHandle("gpt-6-luna"), true)))
+        .not.toHaveProperty("prompt_cache_key");
+  }, 15000);
+
+  it.each([
+    { name: "a request with no project block, like compaction", model: "gpt-6-luna",
+      sections: false },
+    { name: "models before GPT-5.6, which route by it", model: "gpt-5.2", sections: true },
+  ])("keeps the chat's prompt cache key on $name", async ({ model, sections }) => {
+    const body = JSON.parse(await captureBody(chatHandle(model), sections));
+    expect(body.prompt_cache_key).toBe("chat-7");
+  }, 15000);
+});
+
+// An env whose platform gateway rides a Workers AI binding answering with `run`.
+function bindingRunEnv(run: (...args: unknown[]) => Promise<unknown>): Cloudflare.Env {
+  return env({
+    CF_AI_GATEWAY_API_TOKEN: undefined,
+    CF_AI_GATEWAY_PROVIDERS: "cloudflare",
+    WORKERS_AI: { run } as unknown as Ai,
+  });
+}
+
+describe("getDecisionModel routing", () => {
+  const CLEF_CONFIG: AiModelConfig = {
+    provider: "cloudflare",
+    model: "@cf/cloudflare/clef",
+    apiToken: "user-token",
+    accountId: "user-account-id",
+  };
+  const CONTEXT: ClassifierContext = {
+    state: { message: "My order never arrived." },
+    questions: {
+      refund: {
+        type: "bool",
+        instructions: "Does the customer want their money back?",
+        criteria: { true: "Asks for a refund", false: "Asks for something else" },
+      },
+    },
+  };
+  // Workers AI's wire format calls `bool` questions and answers `noul`.
+  const WIRE_INPUT = {
+    state: CONTEXT.state,
+    questions: { refund: { ...CONTEXT.questions.refund, type: "noul" } },
+  };
+  // Clef's result carries no Jev-style run record.
+  const CLEF_RESULT = {
+    model: "clef",
+    answers: { refund: { type: "noul", noul: 0.9 } },
+    usage: { input_tokens: 152, output_tokens: 0 },
+  };
+  const ANSWERS = { refund: { type: "bool", probability: 0.9 } };
+  const METADATA_CONTEXT = { source: "model-binding" as const, gadgetId: "gadget-789" };
+  const GATEWAY_METADATA = {
+    user: "owner-456", source: "model-binding", gadgetId: "gadget-789", automated: true,
+  };
+
+  // pi's classify() takes no fetch from getDecisionModel on HTTP routes, so it uses the global one.
+  beforeEach(() => {
+    capturedRequests.length = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      capturedRequests.push({ url: request.url, headers: request.headers, body: await request.text() });
+      return Response.json({ success: true, result: CLEF_RESULT });
+    });
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  // Every decision model in the catalog must be one pi can run.
+  const decisionModelIds = Object.entries(SUGGESTED_MODELS.cloudflare)
+      .filter(([, model]) => model.kind === "decision").map(([id]) => id);
+
+  it.each(decisionModelIds)("decides with %s directly, with the config's own credentials",
+      async (model) => {
+    const decide = getDecisionModel(env({ CF_AI_GATEWAY: undefined }), { ...CLEF_CONFIG, model },
+        INITIATOR);
+
+    expect((await decide(CONTEXT)).answers).toEqual(ANSWERS);
+    expect(capturedRequests).toHaveLength(1);
+    const [request] = capturedRequests;
+    expect(request.url).toBe("https://api.cloudflare.com/client/v4/accounts/user-account-id/ai/run");
+    expect(request.headers.get("authorization")).toBe("Bearer user-token");
+    expect([...request.headers.keys()].filter(name => name.startsWith("cf-aig-"))).toEqual([]);
+    expect(JSON.parse(request.body)).toEqual({ model, input: WIRE_INPUT });
+  });
+
+  it("decides through the platform gateway over HTTPS with the gateway token", async () => {
+    const decide = getDecisionModel(env(), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
+
+    expect((await decide(CONTEXT)).answers).toEqual(ANSWERS);
+    const [request] = capturedRequests;
+    expect(request.url).toBe(
+        "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/workers-ai/run");
+    // Workers AI's /run checks `authorization` itself; the gateway checks its own header.
+    expect(request.headers.get("authorization")).toBe("Bearer gateway-token");
+    expect(request.headers.get("cf-aig-authorization")).toBe("Bearer gateway-token");
+    expect(JSON.parse(request.headers.get("cf-aig-metadata")!)).toEqual(GATEWAY_METADATA);
+  });
+
+  describe("over the Workers AI binding", () => {
+    it("decides through the platform gateway with the binding's run()", async () => {
+      const runs: unknown[][] = [];
+      const decide = getDecisionModel(bindingRunEnv(async (...args) => {
+        runs.push(args);
+        return CLEF_RESULT;
+      }), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
+
+      expect((await decide(CONTEXT)).answers).toEqual(ANSWERS);
+      expect(runs).toEqual([[
+        "@cf/cloudflare/clef", WIRE_INPUT,
+        { gateway: { id: "platform-gateway", metadata: GATEWAY_METADATA } },
+      ]]);
+      expect(capturedRequests).toEqual([]);
+    });
+
+    it("reports a failed run() as an error result", async () => {
+      const decide = getDecisionModel(bindingRunEnv(async () => {
+        throw new Error("3040: Capacity temporarily exceeded");
+      }), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
+
+      expect(await decide(CONTEXT)).toMatchObject({
+        stopReason: "error",
+        errorMessage: expect.stringContaining("Capacity temporarily exceeded"),
+      });
+    });
+  });
 });

@@ -1,8 +1,9 @@
 import { useId, useRef, useState, type FormEvent } from 'react'
 import { Badge, Button, Collapsible, Input, Radio, Select } from '@cloudflare/kumo'
-import { COMPACTION_TRIGGER_RATIO, GATEWAY_MODEL_MODES } from '@gadgets/workshop-shared/api'
+import { COMPACTION_TRIGGER_RATIO, GATEWAY_MODEL_MODES, modelKind } from '@gadgets/workshop-shared/api'
 import type {
   AdminModelView,
+  GatewayModelCapabilities,
   GatewayModelMode,
   GatewayModelSettings,
   ReasoningLevel,
@@ -39,6 +40,19 @@ const DEPLOYMENT_DEFAULT = 'default'
 const SMALL_BUDGET = 100_000
 
 const tokenCount = (tokens: number) => `${tokens.toLocaleString()} tokens`
+
+// What is stated of an added model, each fact as its row words it. Empty where nothing is.
+const statedFacts = ({ imageInput, reasoningLevels }: GatewayModelCapabilities = {}): string[] => {
+  const facts: string[] = []
+  if (imageInput !== undefined) facts.push(imageInput ? 'takes images' : 'takes no images')
+  if (reasoningLevels !== undefined) {
+    const levels = reasoningLevels.map((level) => REASONING_LEVEL_LABELS[level]).join(', ')
+    // A list with no level above Off states a model that does no reasoning.
+    facts.push(
+      reasoningLevels.some((level) => level !== 'off') ? `reasoning levels ${levels}` : 'no reasoning')
+  }
+  return facts
+}
 
 // A write replaces the whole of a model's settings, so each one sends them as they should be
 // afterwards: what the server holds with `change` applied, less the fields that leaves unset.
@@ -84,6 +98,9 @@ export const GatewayModelRow = ({
   const budgetFacts = useId()
   const budgetAlert = useFieldErrorAlert()
 
+  const stated = statedFacts(model.capabilities)
+  // A decision model runs no chat, so the chat-request test and the chat settings don't apply to it.
+  const isDecision = modelKind(model.provider, model.id) === 'decision'
   const ownLevel = model.settings?.reasoning
   const levelInEffect = ownLevel ?? defaultReasoning
   const takesLevels = model.reasoningLevels.length > 0
@@ -145,6 +162,7 @@ export const GatewayModelRow = ({
       <div className="min-w-0 flex-1 basis-56">
         <p className="flex flex-wrap items-center gap-2">
           <span className="min-w-0 break-words text-sm font-medium text-kumo-default">{model.name}</span>
+          {isDecision && <Badge variant="secondary">Decision</Badge>}
           {(model.mode !== model.defaultMode || model.settings !== undefined) && (
             <Badge variant="outline">Changed</Badge>
           )}
@@ -163,6 +181,12 @@ export const GatewayModelRow = ({
               ? '. Not used: this version knows this model itself.'
               : model.behavesLikeKnown === false
                 && '. This version no longer knows that model, so nothing is borrowed.'}
+          </p>
+        )}
+        {stated.length > 0 && (
+          <p className="mt-0.5 text-xs text-kumo-subtle">
+            Stated: {stated.join(' · ')}
+            {model.runtimeKnown && '. Not used: this version knows this model itself.'}
           </p>
         )}
       </div>
@@ -189,7 +213,9 @@ export const GatewayModelRow = ({
         ))}
       </Radio.Group>
 
-      <GatewayTestButton name={model.name} testing={test?.state === 'testing'} onTest={onTest} />
+      {!isDecision && (
+        <GatewayTestButton name={model.name} testing={test?.state === 'testing'} onTest={onTest} />
+      )}
 
       {onRemove && (
         <Button
@@ -205,7 +231,7 @@ export const GatewayModelRow = ({
 
       {/* The test's result brings its own space above it, so this line takes margins in place of
           the row's gap: an empty status then takes no room above the Settings. */}
-      <div className="-mt-2 min-w-0 basis-full">
+      {!isDecision && <div className="-mt-2 min-w-0 basis-full">
         <GatewayTestStatus test={test} subject="model" />
         <Collapsible.Root className="mt-2">
           <Collapsible.DefaultTrigger className="w-fit text-sm">
@@ -305,7 +331,7 @@ export const GatewayModelRow = ({
             </div>
           </Collapsible.DefaultPanel>
         </Collapsible.Root>
-      </div>
+      </div>}
     </li>
   )
 }

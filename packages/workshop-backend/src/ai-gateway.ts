@@ -1,6 +1,6 @@
 import {
   AdminGatewayProvider, AdminModel, AiChatAuthorInfo, AiModelConfig, AiModelProvider, GatewayModel,
-  GatewayModelMode, HTTPS_ONLY_PROVIDERS, ReasoningLevel, SUGGESTED_MODELS,
+  GatewayModelMode, HTTPS_ONLY_PROVIDERS, ModelKind, ReasoningLevel, SUGGESTED_MODELS, modelKind,
 } from "@gadgets/workshop-shared/api";
 import { readAdminConfig } from "./admin-config.js";
 import type { AdminConfig } from "./storage-schema/admin-settings-storage.js";
@@ -48,6 +48,23 @@ export function gatewayModelConfig(model: AdminModel): AiModelConfig {
     // An added model's limits travel in the config, which token budgeting reads ahead of the
     // catalog. A suggested model's are the catalog's own.
     ...(model.added ? tokenLimits(model) : {}),
+  };
+}
+
+/**
+ * The config a gateway model runs with at the reasoning level `reasoning`, or with no level set
+ * when that is null, and with the compaction budget `budget` when one is given. A stored model's
+ * config (see GatewayModels.runConfig) and that of a model an admin tests before adding it are
+ * both built here, so that the test asks what the added model would be asked.
+ */
+export function gatewayRunConfig(
+    model: AdminModel, reasoning: ReasoningLevel | null, budget?: number): AiModelConfig {
+  return {
+    ...gatewayModelConfig(model),
+    ...(model.behavesLike !== undefined ? { behavesLike: model.behavesLike } : {}),
+    ...(model.capabilities !== undefined ? { capabilities: model.capabilities } : {}),
+    ...(reasoning !== null ? { reasoning } : {}),
+    ...(budget !== undefined ? { compactionInputBudget: budget } : {}),
   };
 }
 
@@ -231,9 +248,13 @@ export class GatewayModels {
     return this.#byId.get(id);
   }
 
-  /** The models offered in pickers, i.e. the enabled ones, as AiChatAuthorInfo entries. */
-  list(): AiChatAuthorInfo[] {
-    return this.all.filter(model => model.mode === "enabled")
+  /**
+   * The models of one kind offered in pickers, i.e. the enabled ones, as AiChatAuthorInfo
+   * entries.
+   */
+  list(kind: ModelKind): AiChatAuthorInfo[] {
+    return this.all.filter(model =>
+            model.mode === "enabled" && modelKind(model.provider, model.id) === kind)
         .map(({ id, name }) => ({ type: "agent", id, name }));
   }
 
@@ -259,14 +280,8 @@ export class GatewayModels {
   runConfig(id: string): AiModelConfig | undefined {
     let model = this.#byId.get(id);
     if (!model) return undefined;
-    let reasoning = model.settings?.reasoning ?? this.#defaultReasoning;
-    let budget = model.settings?.compactionInputBudget;
-    return {
-      ...gatewayModelConfig(model),
-      ...(model.behavesLike !== undefined ? { behavesLike: model.behavesLike } : {}),
-      ...(reasoning !== null ? { reasoning } : {}),
-      ...(budget !== undefined ? { compactionInputBudget: budget } : {}),
-    };
+    return gatewayRunConfig(model, model.settings?.reasoning ?? this.#defaultReasoning,
+        model.settings?.compactionInputBudget);
   }
 
   /** Throws if `id` names a gateway model that an admin disabled. */

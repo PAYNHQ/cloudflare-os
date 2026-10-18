@@ -115,7 +115,10 @@ describe("UserDurableObject model editing", () => {
   // The validated RPC boundary lets through properties the argument's type omits.
   it("stores none of the fields that only a deployment sets on its own models", async () => {
     const { user, stored } = await userWithModel();
-    const smuggled = { reasoning: "max", compactionInputBudget: 5, behavesLike: "gpt-6-sol" };
+    const smuggled = {
+      reasoning: "max", compactionInputBudget: 5, behavesLike: "gpt-6-sol",
+      capabilities: { imageInput: true, reasoningLevels: ["high"] },
+    };
     const other = { type: "agent" as const, id: "other", name: "Other" };
     await user.addModel(other, { ...CONFIG, model: "other", ...smuggled } as typeof CONFIG);
     expect(await stored("other")).toStrictEqual(
@@ -439,4 +442,17 @@ describe("UserDurableObject gateway model modes", () => {
           .toBe("Claude Haiku 4.5");
     }, DISABLED));
   });
+
+  // Chats, spawners and the external-message default all take the language models, which no
+  // decision model can serve.
+  it("lists decision models apart from language models", () => inGatewayUser(async user => {
+    await user.addModel({ ...PROFILE, id: "my-clef" },
+        { provider: "cloudflare", model: "@cf/cloudflare/clef", apiToken: "" });
+
+    const decisionIds = ["@cf/cloudflare/clef", "@cf/cloudflare/clef-flash", "my-clef"];
+    expect((await user.listModels("decision")).map(model => model.id)).toEqual(decisionIds);
+    const languageIds = await listedIds(user);
+    expect(languageIds).toContain("@cf/zai-org/glm-5.2");
+    expect(languageIds.filter(id => decisionIds.includes(id))).toEqual([]);
+  }, { addedProviders: ["cloudflare"] }));
 });

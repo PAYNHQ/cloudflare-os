@@ -108,10 +108,6 @@ const files = (gadgetId: number, path: string, text?: string): CodeContent =>
 const edit = (gadgetId: number, path: string, before: string | undefined, after: string) =>
   diffFiles(files(gadgetId, path, before), files(gadgetId, path, after));
 
-const textAfter = (changes: AppliedChange[], gadgetId: number, path: string, base: string) =>
-  changes.reduce((content, { change }) => applyCodeChange(content, change), files(gadgetId, path, base))
-    .get(gadgetId)?.get(path);
-
 const changesOf = (chats: ChatRecorder, chatId: number, count: number) =>
   waitFor(`${count} changes to chat ${chatId}`, async () => {
     const changes = chats.applied.filter(change => change.chatId === chatId);
@@ -124,6 +120,13 @@ const headOf = (workpieces: WorkpieceRecorder, gadgetId: WorkpieceId, after?: st
     return summary?.type === "gadget" && summary.commitId !== undefined &&
         summary.commitId !== after ? summary.commitId : null;
   });
+
+const textAfter = (changes: AppliedChange[], gadgetId: number, path: string, base: string) =>
+  changes.reduce((content, { change }) => applyCodeChange(content, change), files(gadgetId, path, base))
+    .get(gadgetId)?.get(path);
+
+const parentsOf = async (ws: RpcStub<Overseer>, commitId: string) =>
+  (await ws.getCommitLog(commitId, 1))[0]?.parents;
 
 async function expectText(ws: RpcStub<Overseer>, commitId: string, path: string, text: string) {
   expect(await ws.readFilesAtCommit(commitId, [path])).toEqual([[path, { kind: "text", text }]]);
@@ -262,53 +265,89 @@ const MARKERS = "line1\n<<<<<<< mainline\nOURS\n||||||| merged base\nline2\n====
 it.concurrent.for([
   {
     lines: "different", base: "a\nb\nc\nd\ne\n", ours: "A\nb\nc\nd\ne\n", theirs: "a\nb\nc\nd\nE\n",
-    conflictPaths: [], draft: "A\nb\nc\nd\nE\n", resolved: undefined,
+    conflicted: false, draft: "A\nb\nc\nd\nE\n", resolved: undefined,
   },
   {
     lines: "the same", base: "line1\nline2\nline3\n", ours: "line1\nOURS\nline3\n",
-    theirs: "line1\nTHEIRS\nline3\n", conflictPaths: ["APP/app.txt"], draft: MARKERS,
+    theirs: "line1\nTHEIRS\nline3\n", conflicted: true, draft: MARKERS,
     resolved: "line1\nOURS + THEIRS\nline3\n",
   },
 ])("a stale chat edited on $lines lines pulls in mainline and merges", async row => {
   await withOwner(async client => {
-    const { ws, workpieces, chats } = client;
-    const { gadgetId, head } = await seedGadget(client, "app.txt", row.base);
+    const { ws, workpieces } = client;
+    const { gadgetId, head } = await seedGadget(client, "client.js", row.base);
+    using gadget = await ws.getGadget(gadgetId);
     const chatA = await ws.newChat("A", null);
     const chatB = await ws.newChat("B", null);
     const pins = [{ gadgetId, baseCommit: head }];
     await ws.submitCodeChange(chatA, {
       generation: 0, revision: 0, clientId: "a", seq: 1, pins,
-      change: edit(gadgetId, "app.txt", row.base, row.ours),
+      change: edit(gadgetId, "client.js", row.base, row.ours),
     });
     await ws.submitCodeChange(chatB, {
       generation: 0, revision: 0, clientId: "b", seq: 1, pins,
-      change: edit(gadgetId, "app.txt", row.base, row.theirs),
+      change: edit(gadgetId, "client.js", row.base, row.theirs),
     });
+    const codeBaseOfB = async () => (await ws.listChats()).find(chat => chat.id === chatB)?.codeBase;
+    const preview = async () => (await gadget.getUiBundle(chatB))?.jsCode;
 
     expect(await ws.mergeChanges(chatA)).toEqual({ outcome: "merged" });
     const mainline = await headOf(workpieces, gadgetId, head);
     expect(await ws.mergeChanges(chatB)).toEqual({ outcome: "stale" });
-    expect((await ws.listChats()).find(chat => chat.id === chatB)?.codeBase?.generation).toBe(0);
+    expect((await codeBaseOfB())?.generation).toBe(0);
     expect(workpieces.summaries.get(gadgetId)).toMatchObject({ commitId: mainline });
-    await expectText(ws, mainline, "app.txt", row.ours);
+    await expectText(ws, mainline, "client.js", row.ours);
 
-    expect(await ws.updateChatFromMainline(chatB)).toEqual({ conflictPaths: row.conflictPaths });
-    const changes = await changesOf(chats, chatB, 2);
-    expect(textAfter(changes, gadgetId, "app.txt", row.base)).toBe(row.draft);
+    // The update is a merge commit of mainline and the chat's files before it, and the chat's
+    // pin re-roots there. The message that says so carries no change of its own.
+    const conflictPaths = row.conflicted ? ["client.js"] : [];
+    const update = async () => {
+      expect(await ws.updateChatFromMainline(chatB))
+          .toEqual({ conflictPaths: conflictPaths.map(path => `APP/${path}`) });
+      const message = (await changesMessages(ws, chatB)).findLast(entry => entry.mainlineMerge);
+      expect(message?.change).toBeUndefined();
+      expect(message?.mainlineMerge?.gadgets).toEqual(
+          [{ gadgetId, baseCommit: head, chatCommit: expect.any(String), conflictPaths }]);
+      const [{ chatCommit }] = message!.mainlineMerge!.gadgets!;
+      const [{ baseCommit: merged }] = message!.pins!;
+      expect(message?.pins).toEqual([{ gadgetId, baseCommit: merged, mergedCommit: mainline }]);
+      expect(await parentsOf(ws, merged)).toEqual([mainline, chatCommit]);
+      expect(await parentsOf(ws, chatCommit)).toEqual([head]);
+      await expectText(ws, chatCommit, "client.js", row.theirs);
+      await expectText(ws, merged, "client.js", row.draft);
+      expect(await preview()).toBe(row.draft);
+      return { message: message!, merged };
+    };
 
+    const first = await update();
+    const rerooted = await codeBaseOfB();
+    expect(rerooted).toMatchObject({
+      generation: 1, revision: 0, pins: [{ gadgetId, baseCommit: first.merged, mergedCommit: mainline }],
+    });
+    expect(rerooted).not.toHaveProperty("prior");
+
+    // Reverting the update puts the chat back as it was before, stale again.
+    await ws.revertChanges(chatB, first.message.sequence);
+    expect(await preview()).toBe(row.theirs);
+    expect((await codeBaseOfB())?.pins).toEqual([{ gadgetId, baseCommit: head, mergedCommit: head }]);
+    expect(await ws.mergeChanges(chatB)).toEqual({ outcome: "stale" });
+
+    const { merged } = await update();
     if (row.resolved !== undefined) {
-      const update = (await changesMessages(ws, chatB)).find(message => message.mainlineMerge);
-      await expect(ws.revertChanges(chatB, update!.sequence))
-          .rejects.toThrow("Cannot revert changes that include an update from mainline");
-      const { generation, revision } = changes.at(-1)!;
+      const { generation, revision } = (await codeBaseOfB())!;
       await ws.submitCodeChange(chatB, {
         generation, revision, clientId: "b", seq: 2,
-        change: edit(gadgetId, "app.txt", row.draft, row.resolved),
+        change: edit(gadgetId, "client.js", row.draft, row.resolved),
       });
+      expect(await preview()).toBe(row.resolved);
     }
     expect(await ws.mergeChanges(chatB)).toEqual({ outcome: "merged" });
-    await expectText(ws, await headOf(workpieces, gadgetId, mainline), "app.txt",
-        row.resolved ?? row.draft);
+
+    // The merge commit becomes the gadget's head, or the parent of one holding the resolution.
+    const accepted = await headOf(workpieces, gadgetId, mainline);
+    await expectText(ws, accepted, "client.js", row.resolved ?? row.draft);
+    if (row.resolved === undefined) expect(accepted).toBe(merged);
+    else expect(await parentsOf(ws, accepted)).toEqual([merged]);
   });
 });
 
@@ -450,9 +489,12 @@ it.concurrent("deleting a chat drops its provisional gadget, binding claim and a
     if (data === null) throw new Error("The test connection was not created");
     const dataId = await data.getId();
     using app = await ws.createGadget("App", undefined, "APP");
-    const upload = await ws.uploadChatAttachment(
-        { mimeType: "text/plain", content: new TextEncoder().encode("chat A notes"), name: "notes.txt" }, null);
+    const upload = {oid: await ws.uploadBlob(new TextEncoder().encode("chat A notes")),
+      mimeType: "text/plain", name: "notes.txt"};
     const chatA = await ws.newChat("A", null, undefined, [upload]);
+    const message = (await ws.getChatHistory(chatA)).messages.find(m => m.type === "message");
+    if (message?.type !== "message" || !message.attachments?.length) throw new Error("Missing attachment");
+    const attachmentId = message.attachments[0].id;
     const chatB = await ws.newChat("B", null);
     using draft = await ws.createGadget("Draft", chatA, "DRAFT");
     const draftId = await draft.getId();
@@ -462,13 +504,13 @@ it.concurrent("deleting a chat drops its provisional gadget, binding claim and a
         .rejects.toThrow('The gadget name "DRAFT" is claimed by a gadget still pending in another chat');
     await expect(app.bind("DATA", dataId, chatB))
         .rejects.toThrow('The binding name "DATA" is already proposed by another chat.');
-    expect(new TextDecoder().decode(await ws.getChatAttachmentContent(chatA, upload.id))).toBe("chat A notes");
+    expect(new TextDecoder().decode(await ws.getChatAttachmentContent(chatA, attachmentId))).toBe("chat A notes");
 
     await ws.deleteChat(chatA);
 
     await waitFor("the provisional gadget's removal", async () =>
       workpieces.summaries.has(draftId) ? null : true);
-    await expect(ws.getChatAttachmentContent(chatA, upload.id)).rejects.toThrow("Chat attachment not found.");
+    await expect(ws.getChatAttachmentContent(chatA, attachmentId)).rejects.toThrow("Chat attachment not found.");
     using _replacement = await ws.createGadget("Draft", chatB, "DRAFT");
     await app.bind("DATA", dataId, chatB);
     expect(await app.listBindings(chatB))
@@ -706,7 +748,7 @@ it.concurrent("agent code runs the gadget edits made in earlier steps of its tur
   } });
   const run = (id: string): ChatCompletionStep => ({ toolCall: {
     id, name: "executeCode",
-    arguments: { code: "export default async function(self, env) { return await env.APP.version(); }" },
+    arguments: { code: "export default async function(self, env) { return await env.APP.rpc.version(); }" },
   } });
   const model = models.script([
     toolCall("createGadget", { title: "App", bindingName: "APP" }),
@@ -721,4 +763,36 @@ it.concurrent("agent code runs the gadget edits made in earlier steps of its tur
   expect(history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : [])
       .flatMap(call => call.toolName === "executeCode" ? [call.output] : []))
       .toEqual([expect.stringContaining("v1"), expect.stringContaining("v2")]);
+});
+
+it.concurrent("agent code exports a gadget it is building through its binding's exports", async () => {
+  // The export reads the gadget's server, so its content proves which code ran: the draft this
+  // turn wrote, not mainline (where the gadget doesn't exist yet).
+  const exportingServer = `import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";\n` +
+      `export class Gadget extends DurableObject {\n  rows() { return "a,b\\n1,2\\n"; }\n}\n` +
+      `export class ExportHandler extends WorkerEntrypoint {\n` +
+      `  async getExportFormats(_gadget) {\n` +
+      `    return [{ id: "csv", label: "CSV", mode: "server", contentType: "text/csv", fileExtension: ".csv" }];\n` +
+      `  }\n` +
+      `  async export(gadget, _id) { return new Response(await gadget.rows()).body; }\n` +
+      `}\n`;
+  const model = models.script([
+    toolCall("createGadget", { title: "App", bindingName: "APP" }),
+    toolCall("writeFile", { workpiece: "APP", filename: "server.js", content: exportingServer }),
+    toolCall("executeCode", { code: `export default async function(self, env) {
+  let formats = await env.APP.exports.getFormats();
+  console.log("formats:", formats.map(format => format.id).join(","));
+  console.log("csv:", JSON.stringify(await new Response(await env.APP.exports.export("csv")).text()));
+}` }),
+    { text: "Done." },
+  ]);
+  await using session = await openAgentSession(harness.url, {
+    modelId: SCRIPTED_MODEL_ID, userModel: model.userModel,
+  });
+  const { outcome, history } = await session.runTurn("Build an app and export it as CSV.");
+  expect(outcome).toEqual({ status: "completed" });
+  const [output] = history.flatMap(message => message.type === "message" ? message.toolCalls ?? [] : [])
+      .flatMap(call => call.toolName === "executeCode" ? [call.output] : []);
+  expect(output).toContain("formats: csv");
+  expect(output).toContain(`csv: "a,b\\n1,2\\n"`);
 });
