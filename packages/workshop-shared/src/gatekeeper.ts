@@ -366,6 +366,17 @@ export type SupportedResource = {
    * on this flag rather than probing, since RPC stubs cannot report optional-method presence.
    */
   creationConfigurator?: boolean;
+
+  /**
+   * The urlPattern of the type whose connect card this type appears on, instead of a card of its
+   * own. A card's types share one configurator, which may return a URL of any of them, so
+   * startResourceConfigurator must return that configurator for each of them.
+   *
+   * Each type is still granted separately: holding a grant for one does not cover the others. The
+   * configurator offers only the types the account has granted, and the Workshop asks for the rest
+   * in a single consent request, so group only types that need the same authorization.
+   */
+  groupedWith?: string;
 }
 
 /** Removes every trailing slash from a string in linear time. */
@@ -490,6 +501,13 @@ export interface ResourceConfiguratorHost extends RpcTarget {
    * pre-filled and editable.
    */
   getInitialResource(): Promise<{ resourceUrl: string; resourceUrlPattern: string } | null>;
+
+  /**
+   * The resource types (urlPatterns) the Workshop asks this configurator to choose among, so one
+   * that can return several (see SupportedResource.groupedWith) offers only these. For a creation
+   * configurator, this is the type being created.
+   */
+  getAcceptedResourceUrlPatterns(): Promise<string[]>;
 
   /**
    * Update the parent's iframe sizing to match content in selection/configuration UI.
@@ -687,6 +705,36 @@ export interface GatekeeperVendor extends WorkerEntrypoint {
     resource: SupportedResource;
     action: ActionDescription;
   }>;
+
+  /**
+   * The version tag of the running version of this gatekeeper's Worker, from its
+   * `CF_VERSION_METADATA` binding, or undefined when it has none. Implement it as
+   * `workerVersionTag(this.env)`. The Workshop compares it with the tag the service that installed
+   * the deployment recorded, to tell its admins whether the deployment was modified. It is
+   * deliberately not part of VendorDescription, which every signed-in user receives: the tag
+   * names the release and the installation, so it is for the deployment's admins only. Since RPC
+   * stubs cannot report optional-method presence, the Workshop calls it on every vendor and reads
+   * a vendor without it (a call that throws) as one whose version is unknown.
+   */
+  versionTag?(): Promise<string | undefined>;
+}
+
+/**
+ * The version tag of the running version of a Worker, read from the `CF_VERSION_METADATA`
+ * version-metadata binding in its `env`, or undefined when it has no such binding or the tag is
+ * empty. Never throws. Takes `env` as a plain object because no public gatekeeper config declares
+ * the binding: the service that installs a deployment adds it.
+ */
+export function workerVersionTag(env: object): string | undefined {
+  try {
+    if (!("CF_VERSION_METADATA" in env)) return undefined;
+    const metadata = env.CF_VERSION_METADATA;
+    if (typeof metadata !== "object" || metadata === null || !("tag" in metadata)) return undefined;
+    const tag = metadata.tag;
+    return typeof tag === "string" && tag !== "" ? tag : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface GatekeeperConnectCallback extends WorkerEntrypoint {
@@ -1107,6 +1155,10 @@ export interface Gatekeeper<Session> extends DurableObject {
   /**
    * Indicates that an action was rejected by the user. The gatekeeper should clean up any
    * associated storage.
+   *
+   * Rejecting withdraws the action and must succeed even when the provider outcome of an earlier
+   * `applyAction()` is uncertain: refusing would leave the user no way to clear it. The gatekeeper
+   * stops tracking the action; an effect that already landed at the provider stays.
    *
    * If the returned `restart` flag is true, rejecting this action requires restarting the Gadget.
    * This is sometimes needed by gatekeepers that simulate actions as if they had been approved --
