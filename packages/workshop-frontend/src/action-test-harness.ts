@@ -34,7 +34,9 @@ export function entry(id: number, over: Partial<Record<string, unknown>> = {}): 
     createdAt: new Date(1700000000000 + id * 60_000),
     state: 'pending',
     type: 'action',
-    description: { title: `Action ${id}`, description: '', implementsRevert: false },
+    description: {
+      title: `Action ${id}`, description: '', implementsRevert: false, autoApprovable: false,
+    },
     ...over,
   } as ActionLogEntry
 }
@@ -123,6 +125,34 @@ export function makeOverseer() {
       await act(async () => { subscriber!.entry(record) })
     },
   }
+}
+
+/** A promise for a test to settle when it chooses, inside act(). */
+export function deferred<T = void>() {
+  let settle!: { resolve: (value: T) => void, reject: (error: unknown) => void }
+  const promise = new Promise<T>((resolve, reject) => { settle = { resolve, reject } })
+  return {
+    promise,
+    async resolve(value: T) { await act(async () => settle.resolve(value)) },
+    async reject(error: unknown) { await act(async () => settle.reject(error)) },
+  }
+}
+
+/** The switch of the hook titled `title`, found by its accessible name. */
+export function hookSwitch(title: string): HTMLButtonElement {
+  const element = document.querySelector(`[role="switch"][aria-label="Hook: ${title}"]`)
+  if (!(element instanceof HTMLButtonElement)) throw new Error(`No switch for the hook "${title}"`)
+  return element
+}
+
+/**
+ * Flip the switch of the hook titled `title`, as a click would: through the checkbox the switch
+ * forwards its clicks to, since jsdom has no PointerEvent to forward them with.
+ */
+export async function clickHookSwitch(title: string): Promise<void> {
+  const checkbox = hookSwitch(title).nextElementSibling
+  if (!(checkbox instanceof HTMLInputElement)) throw new Error(`No checkbox behind the hook "${title}"`)
+  await act(async () => checkbox.click())
 }
 
 /** A DOM root with act()-wrapped render/unmount. cleanup() resets it for the next test. */

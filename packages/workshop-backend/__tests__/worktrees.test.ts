@@ -96,7 +96,7 @@ function addChat(impl: any, id: number): void {
 
 async function commitFiles(
     impl: any, files: Record<string, string>, parents: string[] = []): Promise<string> {
-  return await impl.gitStore.writeFilesAsCommit(new Map(Object.entries(files)), {
+  return await impl.gitCache.writeFilesAsCommit(new Map(Object.entries(files)), {
     parents,
     author: { name: "Alice", email: "alice@example.com" },
     message: "test commit",
@@ -856,11 +856,11 @@ describe("worktree commit head advancements", () => {
 
     // Two explicit commits within one step (as two commit() calls in one executeCode would
     // buffer them): the barrier validates the previousHead chain and applies both in order.
-    let c2 = await impl.gitStore.writeChangedFilesAsCommit(
+    let c2 = await impl.gitCache.writeChangedFilesAsCommit(
         new Map([["a.txt", "two\n"]]),
         { treeBase: c1, parents: [c1], author: { name: "A", email: "a@x" },
           message: "first", timestamp: new Date(1700000000_000) });
-    let c3 = await impl.gitStore.writeChangedFilesAsCommit(
+    let c3 = await impl.gitCache.writeChangedFilesAsCommit(
         new Map([["a.txt", "three\n"]]),
         { treeBase: c1, parents: [c2], author: { name: "A", email: "a@x" },
           message: "second", timestamp: new Date(1700000001_000) });
@@ -989,7 +989,7 @@ describe("epoch reset advances the accepted commit", () => {
     expect(await impl.readFileAtCommit(record.pinBase, "a.txt")).toBe("one!\n");
     expect(await impl.readFileAtCommit(record.pinBase, "new.txt")).toBe("fresh\n");
     expect(await impl.readFileAtCommit(record.pinBase, "src/b.txt")).toBeUndefined();
-    let [autoCommit] = await impl.gitStore.readCommitLog(record.pinBase, { depth: 1 });
+    let [autoCommit] = impl.gitCache.readCommitLog(record.pinBase, { depth: 1 });
     expect(autoCommit.parents).toEqual([c1]);
     expect(autoCommit.author.name).toBe(USER.name);
 
@@ -1052,18 +1052,18 @@ describe("epoch reset advances the accepted commit", () => {
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     let { id } = await createThroughBarrier(impl, 1, c1);
 
-    // Clean: nothing touched this epoch, so nothing was pinned and nothing advances.
+    // Clean: nothing touched this epoch, so nothing was pinned and nothing advances. A
+    // worktree's creation proposes nothing, so the accept is a no-op and records nothing.
     await impl.mergeChanges(1, USER_META, "client-user");
     expect(impl.storage.gadgets.get(id)!.pinBase).toBe(c1);
-    expect(chatMessages(impl, 1).find(msg => msg.type === "merge")!.worktreePins)
-        .toBeUndefined();
+    expect(chatMessages(impl, 1).filter(msg => msg.type === "merge")).toEqual([]);
     expect(codeBaseOf(impl, 1).pins).toEqual([]);
 
     // Edit, then advance the head to a commit capturing exactly that edit (as an explicit
     // commit() would): the accept's flatten equals the head's tree, so the accepted commit
     // becomes the head instead of a new auto-commit.
     await barrier(impl, 1, { changes: [{ change: editChange(id, "a.txt", "one\n", "one!\n") }]});
-    let c2 = await impl.gitStore.writeChangedFilesAsCommit(
+    let c2 = await impl.gitCache.writeChangedFilesAsCommit(
         new Map([["a.txt", "one!\n"]]),
         { treeBase: c1, parents: [c1], author: { name: "A", email: "a@x" },
           message: "explicit", timestamp: new Date(1700000002_000) });
@@ -1091,11 +1091,11 @@ describe("epoch reset advances the accepted commit", () => {
 
     // An explicit commit built the way commit() builds one -- tree from pinBase + (empty)
     // overlay, parent on the last explicit head -- skips both auto-commits in its ancestry.
-    let explicit = await impl.gitStore.writeChangedFilesAsCommit(
+    let explicit = await impl.gitCache.writeChangedFilesAsCommit(
         new Map(), { treeBase: record.pinBase, parents: [record.headCommit],
                      author: { name: "A", email: "a@x" }, message: "explicit",
                      timestamp: new Date(1700000003_000) });
-    let [info] = await impl.gitStore.readCommitLog(explicit, { depth: 1 });
+    let [info] = impl.gitCache.readCommitLog(explicit, { depth: 1 });
     expect(info.parents).toEqual([c1]);
     expect(await impl.readFileAtCommit(explicit, "a.txt")).toBe("three\n");
   }));
@@ -1161,11 +1161,12 @@ describe("logs from the born-pinned version", () => {
     addChat(impl, 1);
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     let { id } = await createThroughBarrier(impl, 1, c1);
+    await barrier(impl, 1, { changes: [{ change: editChange(id, "a.txt", "one\n", "two\n") }]});
     await impl.mergeChanges(1, USER_META, "client-user");
+    let accepted = impl.storage.gadgets.get(id)!.pinBase;
     let repin = makeLegacy(impl, 1, id);
-    expect(repin).toBe(c1);
+    expect(repin).toBe(accepted);
     let generation = codeBaseOf(impl, 1).generation;
-    expect(impl.getProposedChanges(1)).toEqual([]);
     // The vacuous pin reads as a proposed change (a spurious banner on an idle chat), which the
     // accept below is the way out of -- deliberately not migrated.
     expect(impl.chatMetaForClient(impl.storage.chatMeta.get(1)!).proposedChangeWorkpieces)
@@ -1177,7 +1178,7 @@ describe("logs from the born-pinned version", () => {
     expect(await impl.mergeChanges(1, USER_META, "client-user")).toEqual({ outcome: "merged" });
     expect(codeBaseOf(impl, 1).pins).toEqual([]);
     expect(codeBaseOf(impl, 1).generation).toBe(generation + 1);
-    expect(impl.storage.gadgets.get(id)!.pinBase).toBe(c1);
+    expect(impl.storage.gadgets.get(id)!.pinBase).toBe(accepted);
     expect(chatMessages(impl, 1).at(-1)!.type).toBe("merge");
     expect(impl.chatMetaForClient(impl.storage.chatMeta.get(1)!).proposedChangeWorkpieces)
         .toBeUndefined();
@@ -1192,6 +1193,7 @@ describe("logs from the born-pinned version", () => {
     addChat(impl, 1);
     let c1 = await commitFiles(impl, { "a.txt": "one\n" });
     let { id } = await createThroughBarrier(impl, 1, c1);
+    await barrier(impl, 1, { changes: [{ change: { [id]: [["b.txt", { set: "bee\n" }]] } }]});
     await impl.mergeChanges(1, USER_META, "client-user");
     makeLegacy(impl, 1, id);
 

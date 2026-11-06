@@ -3,6 +3,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   ApprovalQueue,
   stripTrailingSlashes,
+  workerVersionTag,
   type AccountDescription,
   type AvatarImage,
   type ConnectHandoff,
@@ -18,6 +19,8 @@ import {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
+import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import INSTANCE_CONFIGURATOR_HTML from "./generated/instance-configurator-ui.txt";
 import AREA_CONFIGURATOR_HTML from "./generated/area-configurator-ui.txt";
 import LABEL_CONFIGURATOR_HTML from "./generated/label-configurator-ui.txt";
@@ -48,6 +51,7 @@ import {
   fetchDashboardConfig,
   resolveTargets,
 } from "./approvals";
+import { autoApprovableKinds, dashboardVerdict, serviceCallVerdict } from "./auto-approval";
 import {
   indexPendingByEntity,
   overlayDashboardConfig,
@@ -260,6 +264,9 @@ function escapeAttr(s: string): string {
 // ---------------------------------------------------------------------------
 // fetch handler: serves the connect form and accepts its POST
 
+// The route checks only path shape before reading the form; the account checks the nonce after.
+const MAX_CONNECT_FORM_BYTES = 16 * 1024;
+
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
@@ -289,9 +296,9 @@ export default {
       }
 
       if (req.method === "POST") {
-        let formData: FormData;
+        let formData: URLSearchParams;
         try {
-          formData = await req.formData();
+          formData = new URLSearchParams(await readTextCapped(req, MAX_CONNECT_FORM_BYTES));
         } catch {
           return new Response("Invalid form submission.", { status: 400 });
         }
@@ -358,6 +365,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     };
   }
 
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
+  }
+
   async connectAccount(callback: Fetcher<GatekeeperConnectCallback>): Promise<{ url: string }> {
     const userObjectId = this.ctx.exports.UserAccount.newUniqueId();
     const nonce = generateNonce();
@@ -417,7 +428,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async prepareReconnect(nonce: string): Promise<void> {
-    this.ctx.storage.kv.put("expiredNotified", false);
+    clearCredentialExpiryLatch(this.ctx.storage.kv);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: nonce,
       expiresAt: Date.now() + NONCE_LIFETIME_MS,
@@ -486,7 +497,7 @@ export class UserAccount extends DurableObject<Env> {
       }
     } else {
       this.ctx.storage.kv.put<StoredCredentials>("credentials", { baseUrl, token });
-      this.ctx.storage.kv.put("expiredNotified", false);
+      clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: HomeAssistantUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.HomeAssistantUserImpl({ props }));
@@ -514,7 +525,7 @@ export class UserAccount extends DurableObject<Env> {
     const creds = commitStagedCredentials<StoredCredentials>(this.ctx.storage.kv, Date.now(), stageId);
     if (!creds) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.ctx.storage.kv.put<StoredCredentials>("credentials", creds);
-    this.ctx.storage.kv.put("expiredNotified", false);
+    clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
 
   getCredentials(): HomeAssistantCredentials {
@@ -526,12 +537,8 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async noteCredentialsExpired(): Promise<void> {
-    if (this.ctx.storage.kv.get<boolean>("expiredNotified")) return;
-    this.ctx.storage.kv.put("expiredNotified", true);
-    const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
-    if (callback) {
-      await callback.credentialsExpired();
-    }
+    await notifyCredentialsExpiredOnce(this.ctx.storage.kv,
+      this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback"), "homeassistant");
   }
 
   async alarm(): Promise<void> {
@@ -978,7 +985,7 @@ class EntityConfiguratorUI extends RpcTarget implements HomeAssistantEntityConfi
 // ---------------------------------------------------------------------------
 // GatekeeperImpl
 
-type HomeAssistantResourceKind = "instance" | "area" | "label" | "device" | "entity";
+export type HomeAssistantResourceKind = "instance" | "area" | "label" | "device" | "entity";
 
 type HomeAssistantGatekeeperImplProps = {
   userObjectId: string;
@@ -1058,6 +1065,10 @@ type PendingActionRow = {
   id: number;
   action: HomeAssistantAction;
   submittedAt: number;
+  /** The verdict submitted with the action; apply re-checks a `true` one (see applyAction). */
+  autoApprovable?: boolean;
+  /** Set when the overseer first applies it, which proves it received the action (see submitWrite). */
+  applyStarted?: true;
 };
 
 // Internal storage row for actions that have been applied. Retained so that revertAction() can
@@ -1160,7 +1171,7 @@ export class HomeAssistantGatekeeperImpl
   }
 
   async getAutoApprovableActions() {
-    return [];
+    return autoApprovableKinds(this.ctx.props.resourceKind, this.ctx.props.resourceId);
   }
 
   async startSession(
@@ -1186,17 +1197,37 @@ export class HomeAssistantGatekeeperImpl
     // The overseer only knows the numeric action ID; the full action lives in DO storage.
     const pending = this.#getPending(actionId);
     if (!pending) {
+      // The overseer records completion only after this returns, so an apply that already ran can
+      // be delivered again after a lost reply or a restart; it has nothing left to do.
+      if (this.#getApplied(actionId) !== undefined) return;
       throw new Error(`No queued Home Assistant action exists with id ${actionId}.`);
     }
     const action = pending.action;
+    if (!pending.applyStarted) this.ctx.storage.kv.put<PendingActionRow>(`pending:${actionId}`, { ...pending, applyStarted: true });
     const creds = await this.#getCreds();
-
     let revertInfo: HomeAssistantRevertInfo;
     try {
       revertInfo = await this.#snapshotForRevert(action, creds);
     } catch {
       // If we can't snapshot, proceed without revert.
       revertInfo = { type: "noRevert" };
+    }
+
+    // Home Assistant resolves area, device, label and floor targets when the call runs, so what a
+    // device-control call reaches can change while it is queued (a template switch moved into the
+    // area). One that could be auto-approved is held unless it would still qualify now, checked
+    // last, just before the call: Home Assistant has no conditional call to close the gap entirely.
+    // An apply cannot tell a rule's approval from a person's, so this holds one a person approved
+    // too, as GitHub's and GitLab's push gates and Calendar's do: they approved what the card
+    // showed, which reached only device control.
+    if (action.type === "callService" && pending.autoApprovable === true &&
+        !serviceCallVerdict(action, await fetchRegistrySnapshot(creds)).autoApprovable) {
+      throw new Error("What this call reaches has changed since it was queued, so it is no longer only device control. Queue it again to have it reviewed.");
+    }
+    // The same holds for the entities a dashboard shows controls for.
+    if (action.type === "saveDashboard" && pending.autoApprovable === true &&
+        !dashboardVerdict(action.config, await fetchRegistrySnapshot(creds)).autoApprovable) {
+      throw new Error("An entity this dashboard shows has changed since it was queued, so its controls are no longer only device control. Queue it again to have it reviewed.");
     }
 
     try {
@@ -1343,9 +1374,14 @@ export class HomeAssistantGatekeeperImpl
           description = describeAction(action, emptyRegistry);
         }
 
+        self.ctx.storage.kv.put<PendingActionRow>(`pending:${id}`, { ...row, autoApprovable: description.autoApprovable });
         try {
           await approvalQueue.submitAction(id, description);
         } catch (e) {
+          // An auto-approval can apply the action before the reply arrives, so a lost reply on an
+          // action the overseer has started applying proves it received it; failing would invite a
+          // repeated call, and dropping the row would take away its retry.
+          if (self.ctx.storage.kv.get(`applied:${id}`) !== undefined || self.#getPending(id)?.applyStarted) return;
           // The submit failed (e.g., the approval queue stub is gone). Drop the pending row.
           self.#deletePending(id);
           throw e;

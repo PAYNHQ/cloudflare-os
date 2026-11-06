@@ -6,15 +6,15 @@
 // every operation resolves against the running turn's state through WorktreeTurnAccess
 // (agent.ts), so binding operations and file-tool operations see one consistent worktree, and
 // writes and commits buffer into the same step and become durable at the same barrier. The git
-// side -- base-tree walks, blob reads, commit writes -- goes through the host's WorkspaceGitCache
-// and GitStore, the same plumbing the file tools' lazy reads use.
+// side -- base-tree walks, blob reads, commit writes -- goes through the host's WorkspaceGitCache,
+// the same plumbing the file tools' lazy reads use.
 //
 // The env.GIT binding (git-binding.ts) serves this same class for its in-memory worktrees,
 // substituting a single object holding the worktree's state for both the turn and the host.
 //
 // Content rules match the file tools': regular files of either mode are operable (an edited
 // executable keeps its bit), symlink/gitlink/directory paths throw their descriptive errors,
-// and unreadable *content* (oversized/binary) is distinguished from path-shape errors by
+// and unreadable *content* (binary) is distinguished from path-shape errors by
 // UnreadableContentError -- writeFile falls back to a whole-file `set` on it, while grep
 // reports it as a structured error entry (a "(skipped: ...)" note in the freeform format) and
 // diff likewise (a "(cannot diff ...)" note).
@@ -27,12 +27,14 @@ import type {
   WorktreeFileEntry,
 } from "./worktree-binding";
 import type { AiChatAuthorInfo, WorkpieceId } from "@gadgets/workshop-shared/api";
-import { diffFiles, type FileChange } from "@gadgets/workshop-shared/code-change";
+import {
+  diffFiles, validateCodeChangeSchema, type BytesRef, type FileChange, type FileContent,
+} from "@gadgets/workshop-shared/code-change";
 
-import { UnreadableContentError, type WorkspaceGitCache } from "./git-cache";
-import { commitIdentityForAuthor, type GitStore } from "./git-store";
+import { UnreadableContentError, commitIdentityForAuthor, type WorkspaceGitCache } from "./git-cache";
 import { formatUnifiedDiff, type WorktreeTurnAccess } from "./agent";
-import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
+import { formatGrep, scanWorkpieceForGrep } from "./grep";
+import { blobByteStream } from "./git-chunked-blob";
 
 /**
  * What the session needs from the overseer: the git plumbing and the worktree's registry record
@@ -40,7 +42,6 @@ import { formatGrep, matchLines, scanWorkpieceForGrep } from "./grep";
  */
 export interface WorktreeSessionHost {
   gitCache: WorkspaceGitCache;
-  gitStore: GitStore;
   getWorktreeRecord(id: WorkpieceId): WorktreeRecordView;
 }
 
@@ -161,12 +162,58 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     return text;
   }
 
+  async #byteValue(path: string): Promise<FileContent> {
+    const overlay = this.turn.getOverlayFiles(this.worktreeId);
+    const value = overlay.get(path);
+    if (value !== undefined) return value;
+    if (this.turn.getRemovedPaths(this.worktreeId).has(path)) throw new Error(`${path}: no such file`);
+    const base = await this.host.gitCache.fileBytesAtCommit(this.#pinBase(), path);
+    // The session may have closed while the base faulted in; do not serve it after revocation.
+    this.#pinBase();
+    if (!base) throw new Error(`${path}: no such file`);
+    const current = this.turn.getOverlayFiles(this.worktreeId).get(path);
+    if (this.turn.getRemovedPaths(this.worktreeId).has(path)) throw new Error(`${path}: no such file`);
+    return current ?? base;
+  }
+  async readBytes(path: string, range?: {offset: number; length: number}): Promise<ReadableStream<Uint8Array>> {
+    this.#pinBase();
+    const value = await this.#byteValue(path);
+    if (typeof value === "string") {
+      const bytes = new TextEncoder().encode(value);
+      const {offset, length} = checkByteRange(range, bytes.length);
+      return new ReadableStream({pull: c => {
+        this.#pinBase();
+        c.enqueue(bytes.slice(offset, offset + length)); c.close();
+      }}, {highWaterMark: 0});
+    }
+    // A blob streams a piece at a time, never read whole, and each piece checks first that the
+    // session is still live, so revocation stops the stream.
+    const reader = this.host.gitCache.openBlobRef(value.oid, value.byteLength);
+    return blobByteStream(reader, checkByteRange(range, reader.size), () => this.#pinBase());
+  }
+  async writeBytes(path: string, content: Uint8Array | ReadableStream<Uint8Array>): Promise<void> {
+    try {
+      await this.host.gitCache.assertWorktreePathWritable(this.#pinBase(), path);
+      this.#pinBase();
+    } catch (err) {
+      if (!(content instanceof Uint8Array)) await content.cancel(err).catch(() => {});
+      throw err;
+    }
+    // A stream's length isn't known up front, so its blob is hashed in a second pass.
+    const value: BytesRef = content instanceof Uint8Array ? this.host.gitCache.writeBlob(content)
+        : await this.host.gitCache.writeBlobStream(content);
+    const change = {setBytes: value};
+    validateCodeChangeSchema({[this.worktreeId]: [[path, change]]});
+    this.#pinBase();
+    this.turn.appendChange(this.worktreeId, path, change);
+  }
   async writeFile(path: string, text: string): Promise<void> {
     let base = this.#pinBase();
     let overlay = this.turn.getOverlayFiles(this.worktreeId);
     let before: string | undefined;
     if (overlay.has(path)) {
-      before = overlay.get(path);
+      const value = overlay.get(path);
+      before = typeof value === "string" ? value : undefined;
     } else if (!this.turn.getRemovedPaths(this.worktreeId).has(path)) {
       // The base entry is still live: reject symlink/gitlink/directory targets with the
       // descriptive read errors (the same rule as the writeFile tool), then read the base text
@@ -211,19 +258,15 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
 
   async grep(pattern: RegExp, path?: string | string[]): Promise<string> {
     let scan = await scanWorkpieceForGrep(
-        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path);
-    return formatGrep(scan, pattern, Infinity);
+        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path, pattern);
+    return formatGrep(scan, Infinity);
   }
 
   async structuredGrep(pattern: RegExp, path?: string | string[])
       : Promise<StructuredGrepResult> {
-    let { files, errors } = await scanWorkpieceForGrep(
-        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path);
-    return {
-      matches: files.flatMap(file =>
-          matchLines(file.text, pattern).map(match => ({ file: file.path, ...match }))),
-      errors,
-    };
+    let { matches, errors } = await scanWorkpieceForGrep(
+        this.host.gitCache, this.turn, this.worktreeId, this.#pinBase(), path, pattern);
+    return { matches, errors };
   }
 
 
@@ -240,14 +283,14 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     // auto-commits since, they simply never appear in this commit's ancestry (squash semantics;
     // see WorktreeRecord). The overlay may include lazily-read untouched files; content
     // addressing makes rewriting them a no-op that reuses their blob oids and modes.
-    let changes = new Map<string, string | null>();
+    let changes = new Map<string, FileContent | null>();
     for (let [path, text] of this.turn.getOverlayFiles(this.worktreeId)) {
       changes.set(path, text);
     }
     for (let path of this.turn.getRemovedPaths(this.worktreeId)) {
       changes.set(path, null);
     }
-    let commit = await this.host.gitStore.writeChangedFilesAsCommit(changes, {
+    let commit = await this.host.gitCache.writeChangedFilesAsCommit(changes, {
       treeBase: base,
       parents: [previousHead],
       author,
@@ -321,7 +364,7 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     for (let path of removed) paths.add(path);
 
     // A side that cannot be rendered as text -- a symlink or submodule entry, or unreadable
-    // (oversized/binary) content -- contributes a note carrying its descriptive error instead
+    // (binary) content -- contributes a note carrying its descriptive error instead
     // of a diff. Only those expected shapes degrade to notes: the entry's kind is resolved
     // first and the text read catches exactly UnreadableContentError, so an operational
     // failure (a pull outage, a corrupt object) still fails the diff rather than silently
@@ -349,10 +392,11 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
       let newSide: DiffSide;
       if (overlay.has(path)) {
         // An overlay file keeps its base entry's mode (the one a commit would write, see
-        // GitStore.writeChangedFilesAsCommit); a new one is a regular file.
+        // WorkspaceGitCache.writeChangedFilesAsCommit); a new one is a regular file.
         let baseEntry = await this.host.gitCache.pathEntryAtCommit(base, path);
-        newSide = { text: overlay.get(path),
-                    kind: baseEntry?.kind === "executable" ? "executable" : "file" };
+        const value = overlay.get(path);
+        newSide = typeof value === "string" ? { text: value,
+          kind: baseEntry?.kind === "executable" ? "executable" : "file" } : {note: "binary content changed"};
       } else if (removed.has(path)) {
         newSide = {};  // removed: no current text
       } else {
@@ -367,6 +411,15 @@ export class WorktreeSessionImpl extends RpcTarget implements Worktree {
     }
     return files;
   }
+}
+
+/** Validates a readBytes range against a file of `size` bytes; no range means the whole file. */
+function checkByteRange(range: {offset: number; length: number} | undefined, size: number)
+    : {offset: number; length: number} {
+  const offset = range?.offset ?? 0, length = range?.length ?? size;
+  if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0 ||
+      offset > size || length > size - offset) throw new Error("Invalid byte range.");
+  return {offset, length};
 }
 
 /** One side of a path being diffed: its text and kind (absent where it doesn't exist), or a note. */

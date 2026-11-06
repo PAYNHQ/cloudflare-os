@@ -3,7 +3,7 @@ import {type AiChatAuthorInfo, type AiChatMessage, type AiChatMessageBody}
   from "@gadgets/workshop-shared/api";
 import {
   buildCompactionState, buildSummaryPrompt, findCompactionBoundary, findProtectedFromSequence,
-  foldProposedChanges, getModelTokenLimits, isCompactionTurn, protectRetainedReverts,
+  foldProposedChanges, getModelTokenLimits, isCompactionTurn,
   shouldCompactChat, startsAgentTurn,
 } from "../src/agent-compaction";
 import {applyCodeChange, type CodeChange} from "@gadgets/workshop-shared/code-change";
@@ -251,6 +251,7 @@ describe("compaction boundary", () => {
     expect(findProtectedFromSequence(pending)).toBe(1);
   });
 
+  // Below a 66,667-token budget, 30 percent is smaller than the fixed limit and binds.
   it("keeps complete recent turns within the 30 percent target", () => {
     let messages = [
       message(0, user, "a".repeat(40_000)),
@@ -261,8 +262,22 @@ describe("compaction boundary", () => {
       message(5, agent, "f".repeat(40_000)),
     ];
 
-    // Exclusive: everything below 4 is summarized, so the last turn is retained whole.
-    expect(findCompactionBoundary(projection(messages), 100_000, 120_000)).toBe(4);
+    // About 9,500 tokens a message. Exclusive: the 18k share stops the walk at 4, so the last turn
+    // is retained whole; the 20k limit would have gone on to 3.
+    expect(findCompactionBoundary(projection(messages), 60_000, 57_000)).toBe(4);
+  });
+
+  // On a 1M-token window, 30 percent would retain 300k tokens. The fixed limit binds instead, so
+  // a compaction frees most of a large window just as it does a small one.
+  it("retains about 20k tokens however large the window", () => {
+    // Equal messages, so each holds a twelfth of the measured tokens.
+    let messages = projection(Array.from({ length: 12 }, (_, index) =>
+      message(index, index % 2 === 0 ? user : agent, "x".repeat(4_000))));
+
+    // About 67k tokens a message: the newest record alone passes the limit.
+    expect(findCompactionBoundary(messages, 1_000_000, 800_000)).toBe(11);
+    // About 7,500 tokens a message: the walk stops at the record that passes 20k.
+    expect(findCompactionBoundary(messages, 1_000_000, 90_000)).toBe(9);
   });
 
   it("stops the boundary short of a pending connection request", () => {
@@ -325,35 +340,6 @@ describe("compaction boundary", () => {
     ];
 
     expect(findCompactionBoundary(projected, 100_000, 120_000, 5)).toBe(7);
-  });
-});
-
-describe("retained reverts", () => {
-  it("keeps a revert together with the changes it names", () => {
-    let messages: AiChatMessage[] = [
-      record(2, agent, {type: "changes", change: codeChange("a")}),
-      record(5, user, {type: "revert", revertFrom: 2}),
-    ];
-
-    // The revert stays retained, so its target must stay retained too.
-    expect(protectRetainedReverts(4, messages)).toBe(2);
-  });
-
-  // Lowering the boundary for the later revert retains the earlier one, whose own target would then
-  // be compacted. Walking oldest-first would stop at 4 and leave that revert dangling.
-  it("settles when lowering the boundary retains an earlier revert", () => {
-    let messages: AiChatMessage[] = [
-      record(10, user, {type: "revert", revertFrom: 3}),
-      record(20, user, {type: "revert", revertFrom: 4}),
-    ];
-
-    expect(protectRetainedReverts(15, messages)).toBe(3);
-  });
-
-  it("refuses when protecting a revert would not advance the boundary", () => {
-    let messages: AiChatMessage[] = [record(5, user, {type: "revert", revertFrom: 2})];
-
-    expect(protectRetainedReverts(4, messages, 2)).toBeUndefined();
   });
 });
 
@@ -487,6 +473,32 @@ describe("compaction checkpoint state", () => {
     expect(state.epoch).toBeUndefined();
   });
 
+  // A revert recorded after the boundary reaches the changes before it: compaction cuts between
+  // the two, and a revert refolds the checkpoints it reaches.
+  it("drops the changes and pins a revert after the boundary discarded", () => {
+    let state = buildState([
+      record(0, agent, {type: "changes", change: codeChange("a", "kept.js"), pins: [pin7]}),
+      record(1, agent, {type: "changes", change: codeChange("b", "reverted.js"), pins: [pin9]}),
+      message(2, user, "Undo that."),
+      record(3, user, {type: "revert", revertFrom: 1}),
+    ], 2);
+
+    expect(filesIn(state.proposedChange)).toEqual(["kept.js"]);
+    expect(state.pins).toEqual([pin7]);
+  });
+
+  // Replay applies a later merge to the whole checkpoint; until it does, retained messages still
+  // see the proposed changes.
+  it("leaves a merge after the boundary to replay", () => {
+    let state = buildState([
+      record(0, agent, {type: "changes", change: codeChange("a")}),
+      message(1, user, "Ship it."),
+      record(2, user, {type: "merge", mergeThrough: 1, commits: [], epochBoundary: true}),
+    ], 1);
+
+    expect(filesIn(state.proposedChange)).toEqual(["file.js"]);
+  });
+
   it("resets pins at an epoch boundary, recording the epoch", () => {
     let previous = {
       chatId: 1, compactedTo: 1, summary: "earlier",
@@ -519,6 +531,49 @@ describe("compaction checkpoint state", () => {
       record(0, user, {type: "changes", conversionBoundary: true, change: codeChange("a")}),
     ]);
     expect(proposed.map(batch => batch.sequence)).toEqual([0]);
+  });
+
+  it("drops a re-rooted gadget's earlier changes, the previous checkpoint's included", () => {
+    // Gadget 1 is edited in two batches either side of a checkpoint, then re-rooted at a merge
+    // commit; gadget 2's edit is untouched by the re-root. The re-root's declaration keeps the
+    // head it merged.
+    let other: CodeChange = {2: [["other.js", {set: "other"}]]};
+    let previous = {
+      chatId: 1, compactedTo: 1, summary: "earlier",
+      ...buildState([record(0, agent, {
+        type: "changes", change: {...codeChange("a", "first.js"), ...other}, pins: [pin7],
+      })], 1),
+    };
+    let reroot = {gadgetId: 1, baseCommit: "c".repeat(40), mergedCommit: "d".repeat(40)};
+
+    let next = buildCompactionState([
+      record(1, agent, {type: "changes", change: codeChange("b", "second.js")}),
+      record(2, user, {type: "changes", pins: [reroot], mainlineMerge: {conflictPaths: []}}),
+      record(3, agent, {type: "changes", change: codeChange("c", "third.js")}),
+    ], 4, initialBindings, previous);
+
+    expect(next.pins).toEqual([pin7, reroot]);
+    expect(filesIn(next.proposedChange)).toEqual(["third.js"]);
+    expect(next.proposedChange![2]).toEqual(other[2]);
+
+    // With nothing recorded since, the re-root leaves no change at all, never an empty one.
+    let rootedOnly = buildCompactionState([
+      record(1, user, {type: "changes", pins: [reroot], mainlineMerge: {conflictPaths: []}}),
+    ], 2, initialBindings, {
+      chatId: 1, compactedTo: 1, summary: "earlier",
+      ...buildState([record(0, agent, {type: "changes", change: codeChange("a"), pins: [pin7]})],
+                    1),
+    });
+    expect(rootedOnly.proposedChange).toBeUndefined();
+
+    // A reverted re-root declares nothing, so the changes before it survive.
+    let reverted = buildState([
+      record(0, agent, {type: "changes", change: codeChange("a", "first.js"), pins: [pin7]}),
+      record(1, user, {type: "changes", pins: [reroot], mainlineMerge: {conflictPaths: []}}),
+      record(2, user, {type: "revert", revertFrom: 1}),
+    ], 3);
+    expect(reverted.pins).toEqual([pin7]);
+    expect(filesIn(reverted.proposedChange)).toEqual(["first.js"]);
   });
 
   it("treats a conversion boundary as an epoch boundary for pins and the epoch", () => {

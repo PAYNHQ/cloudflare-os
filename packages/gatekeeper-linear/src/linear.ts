@@ -16,12 +16,15 @@ import {
   ConnectHandoff,
   SupportedResource,
   ResourceConfiguratorFrame,
+  workerVersionTag,
+  type ActionKind,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
   type ActionDescriptionBuilder, buildDescription, plainInline, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
+import { clearCredentialExpiryLatch, notifyCredentialsExpiredOnce } from "@gadgets/gatekeeper-kit/credential-expiry";
 import type {
   Cursor,
   LinearWorkspace,
@@ -71,6 +74,7 @@ import {
   type IssueCreateInput,
   type IssueUpdateInput,
 } from "./linear-api";
+import { autoApprovableKindsOf, autoApprovalOf } from "./linear-auto-approval";
 import {
   LinearWorkspaceConfiguratorUI,
   LinearTeamConfiguratorUI,
@@ -489,6 +493,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     };
   }
 
+  async versionTag(): Promise<string | undefined> {
+    return workerVersionTag(this.env);
+  }
+
   async connectAccount(
     callback: Fetcher<GatekeeperConnectCallback>,
     _options?: GatekeeperConnectOptions,
@@ -537,7 +545,7 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async prepareReconnect(initiationNonce: string): Promise<void> {
-    this.ctx.storage.kv.put("expiredNotified", false);
+    clearCredentialExpiryLatch(this.ctx.storage.kv);
     this.ctx.storage.kv.put<StoredNonce>("nonce", {
       value: initiationNonce,
       expiresAt: Date.now() + INITIATION_NONCE_LIFETIME_MS,
@@ -599,7 +607,7 @@ export class UserAccount extends DurableObject<Env> {
       handoff = await callback.reconnectComplete(stageId);
     } else {
       this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
-      this.ctx.storage.kv.put("expiredNotified", false);
+      clearCredentialExpiryLatch(this.ctx.storage.kv);
       try {
         const props: GatekeeperUserImplProps = { userObjectId: this.ctx.id.toString() };
         handoff = await callback.complete(this.ctx.exports.GatekeeperUserImpl({ props }));
@@ -618,7 +626,7 @@ export class UserAccount extends DurableObject<Env> {
     const grant = commitStagedCredentials<LinearOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.ctx.storage.kv.put<LinearOAuthGrant>("grant", grant);
-    this.ctx.storage.kv.put("expiredNotified", false);
+    clearCredentialExpiryLatch(this.ctx.storage.kv);
   }
 
   /** Returns a currently-valid access token, refreshing it first if it is about to expire. */
@@ -653,19 +661,8 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async noteCredentialsExpired(): Promise<void> {
-    if (this.ctx.storage.kv.get<boolean>("expiredNotified")) return;
-    this.ctx.storage.kv.put("expiredNotified", true);
-    const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
-    if (!callback) return;
-    // Best-effort: never let a failed/disposed callback RPC mask the real error the caller is about
-    // to throw (e.g. the auth error that triggered this notification).
-    try {
-      await callback.credentialsExpired();
-    } catch (err) {
-      logger.warn("failed to notify credential expiry", {
-        event: "credentials.expiry.notify.failed", error: err,
-      });
-    }
+    await notifyCredentialsExpiredOnce(this.ctx.storage.kv,
+      this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback"), VENDOR_ID);
   }
 
   async alarm(): Promise<void> {
@@ -944,7 +941,7 @@ type IssueOverlayPatch = {
   parent?: RawIssue["parent"];
 };
 
-type StoredAction =
+type StoredAction = (
   | { id: number; status: ActionStatus; kind: "createIssue"; input: IssueCreateInput;
       provisionalId: string; createdIssueId?: string; synthetic: RawIssue; title: string }
   | { id: number; status: ActionStatus; kind: "updateIssue"; issueRef: string;
@@ -957,10 +954,20 @@ type StoredAction =
       createdCommentId?: string; synthetic: RawComment; title: string }
   | { id: number; status: ActionStatus; kind: "createLabel"; teamId: string; name: string;
       color?: string; description?: string; createdLabelId?: string; synthetic: RawLabel; title: string }
-  | { id: number; status: ActionStatus; kind: "archive"; issueRef: string; archived: boolean; title: string };
+  | { id: number; status: ActionStatus; kind: "archive"; issueRef: string; archived: boolean; title: string }
+) & {
+  /**
+   * Set when the overseer first applies the action, which proves it received it even if the submit
+   * reply was lost (see `enqueue`).
+   */
+  applyStarted?: true;
+};
 
-// Distributive Omit so the union's variant-specific fields survive; enqueue assigns id + status.
-type StoredActionDraft = StoredAction extends infer T
+/**
+ * A stored action before `enqueue` assigns its id and status. The Omit is distributive, so each
+ * variant keeps its own fields.
+ */
+export type StoredActionDraft = StoredAction extends infer T
   ? T extends { id: number } ? Omit<T, "id" | "status"> : never
   : never;
 
@@ -1146,13 +1153,14 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     this.ctx.storage.kv.put<StoredAction>(`action:${id}`, { ...action, id, status: "pending" } as StoredAction);
     this.#invalidatePendingActions();
     try {
-      await approvalQueue.submitAction(id, description);
+      // The verdict comes from the stored payload, so it always describes what applies.
+      await approvalQueue.submitAction(id, { ...description, ...autoApprovalOf(action) });
     } catch (err) {
       // An auto-approval can apply the action mid-flight, which proves the overseer received it --
       // only the reply was lost, and reporting failure would invite a repeated provider write. A
       // missing record proves nothing: a dependency's rejection cascade deletes it too.
       const current = this.ctx.storage.kv.get<StoredAction>(`action:${id}`);
-      if (current?.status === "applied") return;
+      if (current?.status === "applied" || current?.applyStarted) return;
       if (current) {
         // Drop the record so simulated reads don't show an action no approver can resolve.
         this.ctx.storage.kv.delete(`action:${id}`);
@@ -1484,8 +1492,8 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
     return TYPES_CODE;
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return autoApprovableKindsOf(this.ctx.props.resourceKind);
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<LinearWorkspace | LinearTeam | LinearIssue> {
@@ -1571,6 +1579,13 @@ export class LinearGatekeeperImpl extends DurableObject<Env, LinearGatekeeperImp
   async applyAction(actionId: number): Promise<void> {
     const action = this.ctx.storage.kv.get<StoredAction>(`action:${actionId}`);
     if (!action) throw new Error(`Unknown action: ${actionId}`);
+    // The overseer records completion only after this returns, so a lost reply or a restart in
+    // between re-delivers an apply that already ran; running it again would repeat the write.
+    if (action.status === "applied") return;
+    if (!action.applyStarted) {
+      action.applyStarted = true;
+      this.ctx.storage.kv.put<StoredAction>(`action:${actionId}`, action);
+    }
 
     await this.#run(async api => {
       switch (action.kind) {

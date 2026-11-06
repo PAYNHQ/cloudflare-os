@@ -25,10 +25,10 @@ import {
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import type {
-  AccountDescription, ActionKind, AgentCatalog, ApprovalQueue, ConnectHandoff, Gatekeeper,
-  GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController, HookInitiator,
-  HookTargetMetadata, ResourceDescription, ResourceConfiguratorFrame, SupportedResource,
-  VendorDescription,
+  AccountDescription, ActionDescription, ActionKind, AgentCatalog, ApprovalQueue, ConnectHandoff,
+  Gatekeeper, GatekeeperConnectCallback, GatekeeperUser, GatekeeperUserVerifier, HookController,
+  HookInitiator, HookTargetMetadata, ResourceDescription, ResourceConfiguratorFrame,
+  SupportedResource, VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   ChatGatewayRpcTarget, GadgetResponse, SubmitExternalMessageInput, SubmitExternalMessageResult,
@@ -42,6 +42,7 @@ const SUPPORTED_RESOURCES: SupportedResource[] = [{
   urlPattern: `https://${VENDOR_HOST}/things/*`,
   title: "Test Thing",
   description: "A resource that exists only so tests can bind something.",
+  creatable: true,
 }];
 
 const TYPES_CODE = `
@@ -93,7 +94,8 @@ type HookState = {
   disableCount: number;
 };
 
-function outcomeKey(label: string, resourceUrl?: string): string {
+function outcomeKey(label: string, resourceUrl?: string, subresource?: string): string {
+  if (subresource !== undefined) return `outcome:${label}:${resourceUrl}#${subresource}`;
   return resourceUrl ? `outcome:${label}:${resourceUrl}` : `outcome:${label}`;
 }
 
@@ -103,16 +105,39 @@ function newAccountLabel(): string {
 
 @validateRpc()
 export class TestControl extends DurableObject<Cloudflare.Env> {
-  setVerifyOutcome(label: string, outcome: VerifyOutcome, resourceUrl?: string): void {
-    this.ctx.storage.kv.put(outcomeKey(label, resourceUrl), outcome);
+  setVerifyOutcome(
+      label: string, outcome: VerifyOutcome, resourceUrl?: string, subresource?: string): void {
+    this.ctx.storage.kv.put(outcomeKey(label, resourceUrl, subresource), outcome);
   }
 
-  getVerifyOutcome(label: string, resourceUrl?: string): VerifyOutcome {
-    // A resource-specific outcome wins over a label-wide one. Default to admitting: a
-    // collaborator's first open has to be able to succeed.
-    return this.ctx.storage.kv.get<VerifyOutcome>(outcomeKey(label, resourceUrl))
+  getVerifyOutcome(label: string, resourceUrl?: string, subresource?: string): VerifyOutcome {
+    // A subresource-specific outcome wins over a resource-specific one, which wins over a
+    // label-wide one. Default to admitting: a collaborator's first open has to be able to succeed.
+    return (subresource !== undefined
+        ? this.ctx.storage.kv.get<VerifyOutcome>(outcomeKey(label, resourceUrl, subresource))
+        : undefined)
+        ?? this.ctx.storage.kv.get<VerifyOutcome>(outcomeKey(label, resourceUrl))
         ?? this.ctx.storage.kv.get<VerifyOutcome>(outcomeKey(label))
         ?? { allow: true };
+  }
+
+  /** Answers TestVerifier.deniedSubresources(): input IDs whose verification outcome denies. */
+  deniedSubresources(label: string, subresources: string[]): string[] {
+    return subresources.filter(id => {
+      const [resourceUrl, subresource] = JSON.parse(id) as [string, string];
+      return !this.getVerifyOutcome(label, resourceUrl, subresource).allow;
+    });
+  }
+
+  /**
+   * Makes the binding at `resourceUrl` report its reads' subresources. Read on every observation.
+   */
+  enableSubresourceReporting(resourceUrl: string): void {
+    this.ctx.storage.kv.put(`report-subresources:${resourceUrl}`, true);
+  }
+
+  reportsSubresources(resourceUrl: string): boolean {
+    return this.ctx.storage.kv.get<boolean>(`report-subresources:${resourceUrl}`) ?? false;
   }
 
   recordObserverEvent(event: ObserverEvent): void {
@@ -134,6 +159,14 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
 
   getAmbientVerificationCount(label: string): number {
     return this.ctx.storage.kv.get<number>(`ambient-verifications:${label}`) ?? 0;
+  }
+
+  setAgentCatalog(label: string, catalog: AgentCatalog): void {
+    this.ctx.storage.kv.put(`agent-catalog:${label}`, catalog);
+  }
+
+  getAgentCatalog(label: string): AgentCatalog | null {
+    return this.ctx.storage.kv.get<AgentCatalog>(`agent-catalog:${label}`) ?? null;
   }
 
   recordRevocation(label: string): void {
@@ -175,6 +208,25 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
     state.value = action.value;
     state.applyCount++;
     this.ctx.storage.kv.put(`actions:${label}`, state);
+  }
+
+  /** Moves a simulated thing's staged actions to the account it was created in. */
+  adoptActions(from: string, to: string): void {
+    const source = this.getActionState(from);
+    const state = this.getActionState(to);
+    state.pending.push(...source.pending);
+    state.nextId = Math.max(state.nextId, source.nextId);
+    this.ctx.storage.kv.put(`actions:${to}`, state);
+    this.ctx.storage.kv.delete(`actions:${from}`);
+  }
+
+  /** Each applyCreation() into account `label`, by the configuration it was given. */
+  recordCreation(label: string, configuration: string | null): void {
+    this.ctx.storage.kv.put(`creations:${label}`, [...this.getCreations(label), configuration]);
+  }
+
+  getCreations(label: string): (string | null)[] {
+    return this.ctx.storage.kv.get<(string | null)[]>(`creations:${label}`) ?? [];
   }
 
   failNextApply(label: string, reason: string): void {
@@ -237,22 +289,48 @@ export class TestControl extends DurableObject<Cloudflare.Env> {
     return { enabled: initiator !== undefined, target, disableCount };
   }
 
-  async fireHook(key: string, value: number): Promise<{ fired: true } | { error: string }> {
+  /**
+   * Delivers `value` as an event about the binding at `resourceUrl`, as a provider's event names
+   * its resource: whether it reports `subresources` comes from that binding's current mode, never
+   * from the hook's registration. Without `resourceUrl`, the delivery is a legacy observation that
+   * depends on nothing.
+   */
+  async fireHook(key: string, value: number, resourceUrl?: string, subresources?: string[])
+      : Promise<{ fired: true } | { error: string }> {
     const { initiator } = this.#hook(key);
     if (!initiator) return { error: "hook was never enabled" };
     try {
       const { callback, approvalQueue } = await initiator.startHook();
       try {
-        await approvalQueue.authorizeObservation({
+        const description = {
           title: `Hook ${key} requested ${value}`,
           description: "The integration test fired this hook.",
-        });
+        };
+        if (resourceUrl !== undefined && this.reportsSubresources(resourceUrl)) {
+          const qualified = (subresources ?? []).map(id => JSON.stringify([resourceUrl, id]));
+          await approvalQueue.authorizeObservation({ ...description, subresources: qualified });
+        } else {
+          await approvalQueue.authorizeObservation(description);
+        }
         await callback.onValueRequested(value);
       } finally {
         callback[Symbol.dispose]();
         approvalQueue[Symbol.dispose]();
       }
       return { fired: true };
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  keepSelfStub(key: string, stub: RpcStub<ConnectionProbe>): void {
+    this.ctx.storage.kv.put(`self-stub:${key}`, stub);
+  }
+
+  async callSelfStub(key: string): Promise<{ label: string } | { error: string }> {
+    try {
+      const stub = this.ctx.storage.kv.get<RpcStub<ConnectionProbe>>(`self-stub:${key}`)!;
+      return { label: await stub.label() };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
     }
@@ -372,7 +450,9 @@ function control(exports: Cloudflare.Exports): DurableObjectStub<TestControl> {
 // Vendor
 
 type AccountProps = { label: string };
-type BindingProps = AccountProps & { resourceUrl: string; ambient?: true };
+// `simulated`: minted by GatekeeperVendor.createResource() and not yet created, so nothing may
+// apply through it. It belongs to no account, so its `label` keys only its staged actions.
+type BindingProps = AccountProps & { resourceUrl: string; ambient?: true; simulated?: true };
 
 @validateRpc()
 export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
@@ -413,6 +493,27 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
     const label = newAccountLabel();
     await control(this.ctx.exports).openConnect(label, callback);
     return { url: `https://${VENDOR_HOST}/connect/${label}` };
+  }
+
+  async createResource(_resourceUrlPattern: string, title: string): Promise<{
+    class: DurableObjectClass<Gatekeeper<TestSession>>;
+    resource: SupportedResource;
+    action: ActionDescription;
+  }> {
+    const resourceUrl = `https://${VENDOR_HOST}/things/${encodeURIComponent(title)}`;
+    return {
+      class: this.ctx.exports.TestGatekeeper({
+        props: { label: `creation-${crypto.randomUUID()}`, resourceUrl, simulated: true },
+      }),
+      resource: SUPPORTED_RESOURCES[0],
+      action: {
+        title: `Create the test thing "${title}"`,
+        description: `Create a test thing titled **${title}**.`,
+        descriptionIsComplete: true,
+        implementsRevert: false,
+        autoApprovable: false,
+      },
+    };
   }
 }
 
@@ -503,6 +604,8 @@ export class TestAccount
  */
 export interface TestVerifierApi extends GatekeeperUserVerifier {
   identify(): Promise<string>;
+  /** The given subresource IDs this account may not read. */
+  deniedSubresources(subresources: string[]): Promise<string[]>;
 }
 
 @validateRpc()
@@ -510,6 +613,14 @@ export class TestVerifier
     extends WorkerEntrypoint<Cloudflare.Env, AccountProps> implements TestVerifierApi {
   async identify(): Promise<string> {
     return this.ctx.props.label;
+  }
+
+  /**
+   * Each ID encodes its resource URL and local subresource: grant unless the test refused this
+   * account for that subresource, at that binding, or everywhere (`/control/verify-outcome`).
+   */
+  async deniedSubresources(subresources: string[]): Promise<string[]> {
+    return control(this.ctx.exports).deniedSubresources(this.ctx.props.label, subresources);
   }
 }
 
@@ -519,20 +630,25 @@ export class TestVerifier
 /**
  * A live session against a Test Thing, opened via `GatekeeperClient.openSession()`. `readValue()`
  * records an observation (optionally `containsRestrictedData`); `writeValue()` submits a
- * `set-value` action whose `autoApprovable` verdict and warnings the caller chooses.
+ * `set-value` action whose `autoApprovable` verdict (false unless the caller opts in) and warnings
+ * the caller chooses.
  */
 export interface TestSession {
   /**
    * `restricted` marks the observation `containsRestrictedData`; `ownerInvitesOnly` marks it
    * `ownerInvitesOnly`. `excludeObservers` lists observer ids (from `/control/observer-events`)
-   * that must not see it.
+   * that must not see it. `subresources` are local IDs the read depends on: a binding that reports
+   * subresources reports them on the observation, qualified with the resource URL (`[]` if
+   * omitted); a legacy binding ignores them.
    */
-  readValue(restricted?: boolean, ownerInvitesOnly?: boolean, excludeObservers?: string[])
-      : Promise<number>;
+  readValue(restricted?: boolean, ownerInvitesOnly?: boolean, excludeObservers?: string[],
+            subresources?: string[]): Promise<number>;
   /** `incomplete` omits the `descriptionIsComplete` claim, as a summary-only gatekeeper would. */
   writeValue(value: number, opts?: { autoApprovable?: boolean; incomplete?: boolean }): Promise<number>;
   writeValues(values: number[]): Promise<number[]>;
   watch(key: string, callback: RpcStub<ValueHook>): Promise<void>;
+  /** Stores a persistent stub to this connection under `key`, for `/control/call-self-stub`. */
+  keepSelfStub(key: string): Promise<void>;
 }
 
 /** The hook a gadget binds through `TestSession.watch()`. */
@@ -548,21 +664,31 @@ class TestSessionTarget extends RpcTarget implements TestSession {
       approvalQueue: RpcStub<ApprovalQueue>,
       private readonly state: DurableObjectStub<TestControl>,
       private readonly label: string,
-      private readonly exports: Cloudflare.Exports) {
+      private readonly resourceUrl: string,
+      private readonly ctx: DurableObjectState) {
     super();
     this.approvalQueue = approvalQueue.dup();
   }
 
   async readValue(
-      restricted?: boolean, ownerInvitesOnly?: boolean, excludeObservers?: string[])
-      : Promise<number> {
-    await this.approvalQueue.authorizeObservation({
+      restricted?: boolean, ownerInvitesOnly?: boolean, excludeObservers?: string[],
+      subresources?: string[]): Promise<number> {
+    const reporting = await this.state.reportsSubresources(this.resourceUrl);
+    const description = {
       title: "Read the test value",
       description: "Read the deterministic value exposed by the integration-test gatekeeper.",
       ...(restricted ? { containsRestrictedData: true } : {}),
       ...(ownerInvitesOnly ? { ownerInvitesOnly: true } : {}),
       ...(excludeObservers ? { excludeObservers } : {}),
-    });
+    };
+    if (reporting) {
+      // JSON tuples preserve both resource scope and arbitrary local IDs without delimiter
+      // collisions.
+      const qualified = (subresources ?? []).map(id => JSON.stringify([this.resourceUrl, id]));
+      await this.approvalQueue.authorizeObservation({ ...description, subresources: qualified });
+    } else {
+      await this.approvalQueue.authorizeObservation(description);
+    }
     return 42;
   }
 
@@ -578,7 +704,7 @@ class TestSessionTarget extends RpcTarget implements TestSession {
         implementsRevert: false,
         awaitDecision: true,
         actionKind: SET_VALUE_ACTION_KIND,
-        ...(opts?.autoApprovable ? { autoApprovable: true } : {}),
+        autoApprovable: opts?.autoApprovable === true,
       });
       return id;
     } catch (error) {
@@ -594,9 +720,13 @@ class TestSessionTarget extends RpcTarget implements TestSession {
   async watch(key: string, callback: RpcStub<ValueHook>): Promise<void> {
     await this.approvalQueue.bindHook(
         // @ts-expect-error Workers currently widens the controller's hook type across bindHook RPC.
-        this.exports.TestHookController({ props: { key } }),
+        this.ctx.exports.TestHookController({ props: { key } }),
         callback,
         { title: `Test hook ${key}`, description: "Delivers values the integration test fires." });
+  }
+
+  async keepSelfStub(key: string): Promise<void> {
+    await this.state.keepSelfStub(key, await this.ctx.restore<RpcStub<ConnectionProbe>>({}));
   }
 
   [Symbol.dispose](): void {
@@ -611,6 +741,22 @@ async function waitForApplyRelease(state: DurableObjectStub<TestControl>, label:
   for (const deadline = Date.now() + 30_000; !await state.isApplyReleased(label);) {
     if (Date.now() > deadline) throw new Error("The held test apply was never released.");
     await scheduler.wait(25);
+  }
+}
+
+/** What a connection's persistent stub to itself reaches: a narrow target, never the facet. */
+interface ConnectionProbe extends RpcTarget {
+  label(): Promise<string>;
+}
+
+@validateRpc()
+class ConnectionProbeTarget extends RpcTarget implements ConnectionProbe {
+  constructor(private readonly labelValue: string) {
+    super();
+  }
+
+  async label(): Promise<string> {
+    return this.labelValue;
   }
 }
 
@@ -638,6 +784,15 @@ export class TestGatekeeper
     };
   }
 
+  /** Admits each observer whose verifier reports none of `subresources` denied. */
+  async verifyObserverAccess(
+      observers: { id: string; verifier: Fetcher<TestVerifierApi> }[],
+      subresources: string[]): Promise<{ allowedObserverIds: string[] }> {
+    const denials = await Promise.all(
+        observers.map(({ verifier }) => verifier.deniedSubresources(subresources)));
+    return { allowedObserverIds: observers.filter((_, i) => denials[i].length === 0).map(o => o.id) };
+  }
+
   async getTypeScriptTypes(): Promise<string> {
     return TYPES_CODE;
   }
@@ -647,13 +802,17 @@ export class TestGatekeeper
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<TestSession> {
-    return new TestSessionTarget(
-        approvalQueue, control(this.ctx.exports), this.ctx.props.label, this.ctx.exports);
+    return new TestSessionTarget(approvalQueue, control(this.ctx.exports), this.ctx.props.label,
+        this.ctx.props.resourceUrl, this.ctx);
   }
 
-  /** No discovery index: the ambient fixture is reached through its session alone. */
+  [restore](): ConnectionProbe {
+    return new ConnectionProbeTarget(this.ctx.props.label);
+  }
+
+  /** The discovery index a test set for this account: none unless it set one. */
   async getAgentCatalog(): Promise<AgentCatalog | null> {
-    return null;
+    return control(this.ctx.exports).getAgentCatalog(this.ctx.props.label);
   }
 
   /**
@@ -683,6 +842,7 @@ export class TestGatekeeper
   }
 
   async applyAction(action: number): Promise<void> {
+    if (this.ctx.props.simulated) throw new Error("This test thing has not been created yet.");
     const state = control(this.ctx.exports);
     const { label } = this.ctx.props;
     const held = await state.takeNextApplyHold(label);
@@ -695,6 +855,17 @@ export class TestGatekeeper
 
   async rejectAction(action: number): Promise<void> {
     await control(this.ctx.exports).discardAction(this.ctx.props.label, action);
+  }
+
+  async applyCreation(creator: Fetcher<TestVerifierApi>, configuration: string | null): Promise<{
+    class: DurableObjectClass<Gatekeeper<TestSession>>;
+    resourceUrl: string;
+  }> {
+    const label = await creator.identify();
+    const { resourceUrl } = this.ctx.props;
+    await control(this.ctx.exports).adoptActions(this.ctx.props.label, label);
+    await control(this.ctx.exports).recordCreation(label, configuration);
+    return { class: this.ctx.exports.TestGatekeeper({ props: { label, resourceUrl } }), resourceUrl };
   }
 
   async revertAction(_action: number): Promise<void> {
@@ -769,10 +940,12 @@ export default {
     }
 
     // Set what addObserver() should do for one account, either everywhere or (when `resourceUrl`
-    // is given) at one binding only.
-    // Body: {"label": "...", "allow": false, "reason": "...", "resourceUrl": "..."}
+    // is given) at one binding only. With `subresource` too, it sets whether the account may read
+    // that one subresource, as checked by verifyObserverAccess() where it was reported.
+    // Body: {"label": "...", "allow": false, "reason": "...", "resourceUrl": "...",
+    //        "subresource": "..."}
     if (url.pathname === "/control/verify-outcome" && req.method === "POST") {
-      const { label, allow, reason, resourceUrl } = body as Record<string, unknown>;
+      const { label, allow, reason, resourceUrl, subresource } = body as Record<string, unknown>;
       if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
       if (typeof allow !== "boolean") return badRequest("`allow` must be a boolean");
       if (reason !== undefined && typeof reason !== "string") {
@@ -781,11 +954,29 @@ export default {
       if (resourceUrl !== undefined && !isNonEmptyString(resourceUrl)) {
         return badRequest("`resourceUrl` must be a non-empty string when present");
       }
+      if (subresource !== undefined && !isNonEmptyString(subresource)) {
+        return badRequest("`subresource` must be a non-empty string when present");
+      }
+      if (subresource !== undefined && resourceUrl === undefined) {
+        return badRequest("`subresource` needs `resourceUrl`");
+      }
 
       const outcome: VerifyOutcome = allow
         ? { allow: true }
         : { allow: false, reason: reason ?? "The test gatekeeper refused this account." };
-      await control(ctx.exports).setVerifyOutcome(label, outcome, resourceUrl);
+      await control(ctx.exports).setVerifyOutcome(label, outcome, resourceUrl, subresource);
+      return new Response(null, { status: 204 });
+    }
+
+    // Make the binding at `resourceUrl` report its reads' subresources. Set before connecting for
+    // a binding that reports them from creation.
+    // Body: {"resourceUrl": "..."}
+    if (url.pathname === "/control/report-subresources" && req.method === "POST") {
+      const { resourceUrl } = body as Record<string, unknown>;
+      if (!isNonEmptyString(resourceUrl)) {
+        return badRequest("`resourceUrl` must be a non-empty string");
+      }
+      await control(ctx.exports).enableSubresourceReporting(resourceUrl);
       return new Response(null, { status: 204 });
     }
 
@@ -804,6 +995,20 @@ export default {
       const { label } = body as Record<string, unknown>;
       if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
       return Response.json({ count: await control(ctx.exports).getAmbientVerificationCount(label) });
+    }
+
+    // Set the account's discovery catalog: one entry per skill title.
+    // Body: {"label": "...", "skills": ["...", ...]}
+    if (url.pathname === "/control/agent-catalog" && req.method === "POST") {
+      const { label, skills } = body as Record<string, unknown>;
+      if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
+      if (!Array.isArray(skills) || !skills.every(isNonEmptyString)) {
+        return badRequest("`skills` must be an array of non-empty strings");
+      }
+      await control(ctx.exports).setAgentCatalog(label, {
+        entries: skills.map(title => ({ id: title, title, description: `The ${title} skill.` })),
+      });
+      return new Response(null, { status: 204 });
     }
 
     if (url.pathname === "/control/revocation-count" && req.method === "POST") {
@@ -838,6 +1043,13 @@ export default {
         value: state.value,
         applyCount: state.applyCount,
       });
+    }
+
+    // Body: {"label": "..."} -> {"configurations": (string | null)[]}, one per applyCreation().
+    if (url.pathname === "/control/creations" && req.method === "POST") {
+      const { label } = body as Record<string, unknown>;
+      if (!isNonEmptyString(label)) return badRequest("`label` must be a non-empty string");
+      return Response.json({ configurations: await control(ctx.exports).getCreations(label) });
     }
 
     // Body: {"label": "..."} -> {"attempts": number}
@@ -900,13 +1112,34 @@ export default {
       return Response.json({ responses: await control(ctx.exports).getGadgetResponses(messageKey) });
     }
 
-    // Fire a hook through the initiator its controller's enable() stored.
-    // Body: {"key": "...", "value": number} -> {"fired": true} | {"error": string}
+    // Fire a hook through the initiator its controller's enable() stored, as an event about the
+    // binding at `resourceUrl` whose reads depended on `subresources` (see TestControl.fireHook()).
+    // Body: {"key": "...", "value": number, "resourceUrl"?: "...", "subresources"?: string[]}
+    // -> {"fired": true} | {"error": string}
     if (url.pathname === "/control/fire-hook" && req.method === "POST") {
-      const { key, value } = body as Record<string, unknown>;
+      const { key, value, resourceUrl, subresources } = body as Record<string, unknown>;
       if (!isNonEmptyString(key)) return badRequest("`key` must be a non-empty string");
       if (typeof value !== "number") return badRequest("`value` must be a number");
-      return Response.json(await control(ctx.exports).fireHook(key, value));
+      if (resourceUrl !== undefined && !isNonEmptyString(resourceUrl)) {
+        return badRequest("`resourceUrl` must be a non-empty string when present");
+      }
+      if (subresources !== undefined &&
+          (!Array.isArray(subresources) || !subresources.every(isNonEmptyString))) {
+        return badRequest("`subresources` must be an array of non-empty strings");
+      }
+      if (subresources !== undefined && resourceUrl === undefined) {
+        return badRequest("`subresources` needs `resourceUrl`");
+      }
+      return Response.json(
+          await control(ctx.exports).fireHook(key, value, resourceUrl, subresources));
+    }
+
+    // Call the stub a session's keepSelfStub() stored.
+    // Body: {"key": "..."} -> {"label": string} | {"error": string}
+    if (url.pathname === "/control/call-self-stub" && req.method === "POST") {
+      const { key } = body as Record<string, unknown>;
+      if (!isNonEmptyString(key)) return badRequest("`key` must be a non-empty string");
+      return Response.json(await control(ctx.exports).callSelfStub(key));
     }
 
     // Body: {"key": "..."} -> {"enabled": boolean, "target"?: HookTargetMetadata, "disableCount"}
