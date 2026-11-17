@@ -40,12 +40,12 @@ binary deltas are deliberately not supported. Text transforms remain unchanged.
 
 Ordinary worktree bindings expose `readBytes()` and `writeBytes(path, rawBytes)`; writes store
 the blob before appending its whole-file OT. Both stream: `readBytes()` reads a blob (or a byte
-range of it) a chunk at a time, and `writeBytes()` also accepts a `ReadableStream`. There is no staged/resumable upload protocol.
-Git pack export streams one object at a time, so container materialization can transfer files
-without decoding them as text or buffering the entire repository. Containers consume the same
-canonical worktree rather than needing a separate attachment download path. The container-specific
-replica API remains in the replica/binary follow-up PRs; this attachment ingress does not require
-a container.
+range of it) a chunk at a time, and `writeBytes()` also accepts a `ReadableStream`. There is no
+staged/resumable upload protocol. Containers consume the same canonical worktree rather than
+needing a separate attachment download path: a container gatekeeper clones the scratch worktree
+with native Git through `WorktreeReplicator.gitPull()` and gatekeeper-kit's `serveGitUploadPack()` (see
+[`worktree-replicas.md`](worktree-replicas.md)), which streams files without decoding them as
+text. This attachment ingress does not require a container.
 
 Download/replay reads the original upload's immutable Git blob, not a subsequently edited
 workspace file. On the next message or agent turn, legacy attachments are migrated lazily,
@@ -59,8 +59,13 @@ retryable without blocking other files or future messages. Replay shows an expli
 content marker if an original payload cannot be read, rather than failing the whole chat.
 Model requests inline only compatible image/document inputs and valid text; other files are
 identified by workspace path, never lossy UTF-8 replacement characters or an unsupported
-provider content part. Images with an edge above 8000 pixels or unrecognized dimension headers
-stay workspace-only on every model replay; no resize/transcode changes their original bytes.
+provider content part. Text is inlined only up to `MAX_TOOL_RESULT_CHARS` (32K characters), the
+most `readFile` returns whole. Larger text is also identified by workspace path, for the agent to
+read by window or grep: inlined, it would be resent on every turn, and a single upload can exceed
+the model's context window, which compaction cannot repair. A later upload into an existing
+scratch worktree also reaches the agent as a user change, whose diff is shown only within the same
+limit. Images with an edge above 8000 pixels or unrecognized dimension headers stay
+workspace-only on every model replay; no resize/transcode changes their original bytes.
 When the replay contains more than 20 candidate images/documents, image edges are conservatively
 limited to 2000 pixels, including images attached in earlier turns. Originals remain unchanged.
 New images are read from the same immutable blob for previews; there

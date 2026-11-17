@@ -543,7 +543,7 @@ describe("getModel direct routing (no gateway)", () => {
   it.each([
     ["anthropic", "claude-opus-5-5", "Claude Opus 5.5", 1_000_000],
     ["anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", 1_000_000],
-    ["anthropic", "claude-fable-5-1", "Claude Fable 5.1", 1_000_000],
+    ["anthropic", "claude-fable-5-2", "Claude Fable 5.2", 1_000_000],
     ["openai", "gpt-6.1-sol", "GPT-6.1 Sol", 1_050_000],
     ["openai", "gpt-6-astra", "GPT-6 Astra", 1_050_000],
     ["openai", "gpt-6-sol", "GPT-6 Sol", 1_050_000],
@@ -574,7 +574,7 @@ describe("getModel direct routing (no gateway)", () => {
       : { supportsExplicitPromptCacheMode: true });
   });
 
-  it.each(["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"])(
+  it.each(["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2"])(
       "keeps quick requests valid for %s", async (model) => {
     const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
       provider: "anthropic",
@@ -1091,6 +1091,7 @@ describe("gateway model reasoning levels", () => {
     ["anthropic", "claude-opus-5-5", LOW_TO_MAX],
     ["anthropic", "claude-sonnet-5-5", LOW_TO_MAX],
     ["anthropic", "claude-haiku-5-5", ["off", ...LOW_TO_MAX]],
+    ["anthropic", "claude-fable-5-2", ["minimal", ...LOW_TO_MAX]],
     ["anthropic", "claude-fable-5-1", ["minimal", ...LOW_TO_MAX]],
     ["anthropic", "claude-opus-5", ["off", "minimal", ...LOW_TO_MAX]],
     ["anthropic", "claude-sonnet-5", ["off", "minimal", ...LOW_TO_MAX]],
@@ -1126,6 +1127,7 @@ describe("gateway model reasoning levels", () => {
     ["anthropic", "claude-opus-5-5", "adaptive"],
     ["anthropic", "claude-sonnet-5-5", "adaptive"],
     ["anthropic", "claude-haiku-5-5", "adaptive"],
+    ["anthropic", "claude-fable-5-2", "adaptive"],
     ["anthropic", "claude-fable-5-1", "adaptive"],
     ["anthropic", "claude-opus-5", "adaptive"],
     ["anthropic", "claude-sonnet-5", "adaptive"],
@@ -1823,6 +1825,39 @@ describe("Gemini function call signatures", () => {
         .map(entry => entry.thoughtSignature))
         .toEqual(["c2lnbmF0dXJl", "skip_thought_signature_validator"]);
   }, 15000);
+});
+
+describe("Tool-call arguments", () => {
+  beforeEach(() => {
+    capturedRequests.length = 0;
+  });
+
+  // A model can emit half of a surrogate pair in its arguments, and every later request resends
+  // them; Anthropic rejects a body holding one.
+  it("reach the provider well-formed", async () => {
+    const handle = getModel(env({ CF_AI_GATEWAY: undefined }), {
+      provider: "anthropic",
+      model: "claude-sonnet-4-5",
+      apiToken: "direct-api-token",
+    }, INITIATOR);
+    const stream = handle.stream(handle.model, {
+      messages: [{ role: "user", content: "hello", timestamp: 0 }, {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_1", name: "editFile", arguments: { replacement: "'\ud83d'" } }],
+        api: handle.model.api,
+        provider: handle.model.provider,
+        model: handle.model.id,
+        usage: zeroUsage(),
+        stopReason: "toolUse",
+        timestamp: 0,
+      }],
+    }, { fetch: fetchStub, maxRetries: 0 });
+    expect((await stream.result()).stopReason).toBe("error");
+
+    // Compared JSON-encoded: a lone surrogate in a failure report breaks the vitest pool's WebSocket.
+    expect(JSON.stringify(JSON.parse(capturedRequests[0].body).messages[1].content[0].input))
+        .toBe(JSON.stringify({ replacement: "'\uFFFD'" }));
+  });
 });
 
 // Counts the cache breakpoints in an Anthropic request body.
